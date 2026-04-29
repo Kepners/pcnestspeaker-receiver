@@ -156,7 +156,7 @@
       }
     }
 
-    async function connectWebRTC(serverUrl, streamName = 'pcaudio') {
+    async function createWebRTCPeer(streamName = 'pcaudio', reconnectHandler = null) {
       log('Connecting WebRTC...');
       currentMode = 'webrtc';
 
@@ -167,6 +167,11 @@
       }
       hlsAudio.pause();
       hlsAudio.src = '';
+      whepResourceUrl = null;
+      if (peerConnection) {
+        peerConnection.close();
+        peerConnection = null;
+      }
 
       const iceConfig = { iceServers: [], iceTransportPolicy: 'all' };
       peerConnection = new RTCPeerConnection(iceConfig);
@@ -198,8 +203,12 @@
         console.log('[WebRTC] Connection state:', state);
         if (state === 'connected') log('Streaming audio...');
         else if (state === 'failed') {
-          log('Reconnecting...');
-          setTimeout(() => { disconnect(); connectWebRTC(serverUrl, streamName); }, 3000);
+          if (reconnectHandler) {
+            log('Reconnecting...');
+            setTimeout(reconnectHandler, 3000);
+          } else {
+            log('Connection failed');
+          }
         }
       };
 
@@ -227,15 +236,24 @@
         }
       });
 
-      const whepUrl = serverUrl + '/' + streamName + '/whep';
-      console.log('[WebRTC] WHEP URL:', whepUrl);
+      return peerConnection.localDescription.sdp;
+    }
 
+    async function connectWebRTC(serverUrl, streamName = 'pcaudio') {
       try {
+        const offerSdp = await createWebRTCPeer(streamName, () => {
+          disconnect();
+          connectWebRTC(serverUrl, streamName);
+        });
+
+        const whepUrl = serverUrl + '/' + streamName + '/whep';
+        console.log('[WebRTC] WHEP URL:', whepUrl);
+
         const response = await fetch(whepUrl, {
           method: 'POST',
           mode: 'cors',
           headers: { 'Content-Type': 'application/sdp' },
-          body: peerConnection.localDescription.sdp
+          body: offerSdp
         });
 
         if (!response.ok) throw new Error('WHEP error ' + response.status);
@@ -261,6 +279,43 @@
           log('Connection failed');
           retryCount = 0;
         }
+      }
+    }
+
+    async function requestProxyOffer(streamName = 'pcaudio') {
+      try {
+        const offerSdp = await createWebRTCPeer(streamName);
+        context.sendCustomMessage(WEBRTC_NAMESPACE, undefined, {
+          type: 'offer',
+          stream: streamName,
+          sdp: offerSdp
+        });
+        console.log('[WebRTC] Sent proxied SDP offer');
+      } catch (e) {
+        console.error('[WebRTC] Proxy offer error:', e);
+        context.sendCustomMessage(WEBRTC_NAMESPACE, undefined, {
+          type: 'offer-error',
+          stream: streamName,
+          error: e.message
+        });
+        log('Connection failed');
+      }
+    }
+
+    async function applyProxyAnswer(sdp) {
+      if (!peerConnection) {
+        console.warn('[WebRTC] No pending peer connection for proxy answer');
+        return;
+      }
+
+      try {
+        await peerConnection.setRemoteDescription({ type: 'answer', sdp });
+        retryCount = 0;
+        console.log('[WebRTC] Proxy SDP answer applied');
+        log('Streaming audio...');
+      } catch (e) {
+        console.error('[WebRTC] Proxy answer error:', e);
+        log('Connection failed');
       }
     }
 
@@ -336,6 +391,13 @@
       switch (data.type) {
         case 'connect':
           if (data.url) connectWebRTC(data.url, data.stream || 'pcaudio');
+          break;
+        case 'request_offer':
+        case 'request-offer':
+          requestProxyOffer(data.stream || 'pcaudio');
+          break;
+        case 'answer':
+          if (data.sdp) applyProxyAnswer(data.sdp);
           break;
         case 'hls':
           if (data.url) connectHLS(data.url);
