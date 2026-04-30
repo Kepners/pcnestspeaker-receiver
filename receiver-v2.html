@@ -126,6 +126,134 @@
         });
     }
 
+    function waitForIceGathering() {
+      return new Promise(function(resolve) {
+        if (peerConnection.iceGatheringState === 'complete') {
+          resolve();
+          return;
+        }
+
+        var checkState = function() {
+          if (peerConnection.iceGatheringState === 'complete') {
+            peerConnection.removeEventListener('icegatheringstatechange', checkState);
+            resolve();
+          }
+        };
+        peerConnection.addEventListener('icegatheringstatechange', checkState);
+        setTimeout(resolve, 2000);
+      });
+    }
+
+    function sendProxyMessage(senderId, message) {
+      var payload = JSON.stringify(message);
+      if (senderId) {
+        messageBus.send(senderId, payload);
+      } else {
+        messageBus.broadcast(payload);
+      }
+    }
+
+    function requestProxyOffer(streamName, senderId) {
+      try {
+        log('Preparing WebRTC offer...');
+
+        if (peerConnection) {
+          peerConnection.close();
+          peerConnection = null;
+        }
+        whepResourceUrl = null;
+
+        var iceConfig = {
+          iceServers: []
+        };
+
+        peerConnection = new RTCPeerConnection(iceConfig);
+
+        peerConnection.onaddstream = function(event) {
+          log('Stream received');
+          audioElement.srcObject = event.stream;
+          audioElement.play().catch(function(e) {
+            log('Play error: ' + e.message);
+          });
+        };
+
+        peerConnection.ontrack = function(event) {
+          log('Track received: ' + event.track.kind);
+          if (event.track.kind === 'audio') {
+            if (event.streams && event.streams[0]) {
+              audioElement.srcObject = event.streams[0];
+            } else if (typeof MediaStream !== 'undefined') {
+              audioElement.srcObject = new MediaStream([event.track]);
+            }
+            audioElement.play().catch(function(e) {
+              log('Play error: ' + e.message);
+            });
+          }
+        };
+
+        peerConnection.oniceconnectionstatechange = function() {
+          log('ICE: ' + peerConnection.iceConnectionState);
+          if (peerConnection.iceConnectionState === 'connected') {
+            log('WebRTC Connected!');
+          }
+        };
+
+        if (peerConnection.addTransceiver) {
+          peerConnection.addTransceiver('audio', { direction: 'recvonly' });
+        }
+
+        var offerOptions = peerConnection.addTransceiver ? undefined : {
+          offerToReceiveAudio: true,
+          offerToReceiveVideo: false
+        };
+
+        peerConnection.createOffer(offerOptions)
+          .then(function(offer) {
+            return peerConnection.setLocalDescription(offer);
+          })
+          .then(waitForIceGathering)
+          .then(function() {
+            sendProxyMessage(senderId, {
+              type: 'offer',
+              stream: streamName || 'pcaudio',
+              sdp: peerConnection.localDescription.sdp
+            });
+            log('Sent WebRTC offer');
+          })
+          .catch(function(e) {
+            log('Offer error: ' + e.message);
+            sendProxyMessage(senderId, {
+              type: 'offer-error',
+              stream: streamName || 'pcaudio',
+              error: e.message
+            });
+          });
+      } catch (e) {
+        log('Offer error: ' + e.message);
+        sendProxyMessage(senderId, {
+          type: 'offer-error',
+          stream: streamName || 'pcaudio',
+          error: e.message
+        });
+      }
+    }
+
+    function applyProxyAnswer(sdp) {
+      if (!peerConnection) {
+        log('No pending WebRTC offer');
+        return;
+      }
+
+      peerConnection.setRemoteDescription({
+        type: 'answer',
+        sdp: sdp
+      }).then(function() {
+        log('WebRTC Connected!');
+      }).catch(function(e) {
+        log('Answer error: ' + e.message);
+      });
+    }
+
     function disconnect() {
       if (peerConnection) {
         if (whepResourceUrl) {
@@ -160,6 +288,10 @@
 
       if (data.type === 'connect' && data.url) {
         connectToMediaMTX(data.url, data.stream || 'pcaudio');
+      } else if (data.type === 'request_offer' || data.type === 'request-offer') {
+        requestProxyOffer(data.stream || 'pcaudio', event.senderId);
+      } else if (data.type === 'answer' && data.sdp) {
+        applyProxyAnswer(data.sdp);
       } else if (data.type === 'disconnect' || data.type === 'close') {
         disconnect();
       }
