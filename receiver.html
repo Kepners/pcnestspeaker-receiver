@@ -594,6 +594,120 @@
       }
     }
 
+    async function requestProxyOffer(streamName = 'pcaudio') {
+      try {
+        log('Preparing WebRTC offer...');
+        startAmbientVideos();
+
+        stopRTTMeasurement();
+        if (peerConnection) {
+          peerConnection.close();
+          peerConnection = null;
+        }
+        whepResourceUrl = null;
+
+        const iceConfig = {
+          iceServers: [],
+          iceTransportPolicy: 'all'
+        };
+
+        peerConnection = new RTCPeerConnection(iceConfig);
+
+        peerConnection.ontrack = (event) => {
+          console.log('[WebRTC] Track received:', event.track.kind, event.track.readyState, event.track.muted);
+          log('Track received!');
+
+          if (event.track.kind === 'audio') {
+            if (event.streams && event.streams[0]) {
+              audioElement.srcObject = event.streams[0];
+            } else {
+              audioElement.srcObject = new MediaStream([event.track]);
+            }
+
+            audioElement.muted = false;
+            audioElement.volume = 1.0;
+            audioElement.play().then(() => {
+              log('Streaming audio...');
+            }).catch(() => {
+              audioElement.muted = true;
+              audioElement.play().then(() => {
+                setTimeout(() => {
+                  audioElement.muted = false;
+                  log('Streaming audio...');
+                }, 100);
+              }).catch(() => log('Play failed'));
+            });
+          }
+        };
+
+        peerConnection.onconnectionstatechange = () => {
+          const state = peerConnection.connectionState;
+          console.log('[WebRTC] Connection state:', state);
+          if (state === 'connected') {
+            log('Streaming audio...');
+          } else if (state === 'failed') {
+            log('Connection failed');
+          }
+        };
+
+        peerConnection.oniceconnectionstatechange = () => {
+          console.log('[WebRTC] ICE state:', peerConnection.iceConnectionState);
+        };
+
+        peerConnection.addTransceiver('audio', { direction: 'recvonly' });
+
+        const offer = await peerConnection.createOffer();
+        await peerConnection.setLocalDescription(offer);
+
+        await new Promise((resolve) => {
+          if (peerConnection.iceGatheringState === 'complete') {
+            resolve();
+          } else {
+            const checkState = () => {
+              if (peerConnection.iceGatheringState === 'complete') {
+                peerConnection.removeEventListener('icegatheringstatechange', checkState);
+                resolve();
+              }
+            };
+            peerConnection.addEventListener('icegatheringstatechange', checkState);
+            setTimeout(resolve, 2000);
+          }
+        });
+
+        context.sendCustomMessage(WEBRTC_NAMESPACE, undefined, {
+          type: 'offer',
+          stream: streamName,
+          sdp: peerConnection.localDescription.sdp
+        });
+        console.log('[WebRTC] Sent proxied SDP offer');
+      } catch (e) {
+        console.error('[WebRTC] Proxy offer error:', e);
+        context.sendCustomMessage(WEBRTC_NAMESPACE, undefined, {
+          type: 'offer-error',
+          stream: streamName,
+          error: e.message
+        });
+        log('Connection failed');
+      }
+    }
+
+    async function applyProxyAnswer(sdp) {
+      if (!peerConnection) {
+        console.warn('[WebRTC] No pending peer connection for proxy answer');
+        return;
+      }
+
+      try {
+        await peerConnection.setRemoteDescription({ type: 'answer', sdp });
+        retryCount = 0;
+        console.log('[WebRTC] Proxy SDP answer applied');
+        log('Streaming audio...');
+      } catch (e) {
+        console.error('[WebRTC] Proxy answer error:', e);
+        log('Connection failed');
+      }
+    }
+
     function disconnect() {
       stopRTTMeasurement(); // Stop any ongoing measurement
       if (peerConnection) {
@@ -617,6 +731,13 @@
           if (data.url) {
             connectToMediaMTX(data.url, data.stream || 'pcaudio');
           }
+          break;
+        case 'request_offer':
+        case 'request-offer':
+          requestProxyOffer(data.stream || 'pcaudio');
+          break;
+        case 'answer':
+          if (data.sdp) applyProxyAnswer(data.sdp);
           break;
         case 'disconnect':
         case 'close':
