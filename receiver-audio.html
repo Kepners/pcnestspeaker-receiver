@@ -301,6 +301,21 @@
 
       } catch (e) {
         console.error('[WebRTC] Error:', e);
+        // Surface the failure to PC every attempt so the stream-attempt JSON
+        // captures the receiver-side error instead of silently retrying.
+        try {
+          context.sendCustomMessage(WEBRTC_NAMESPACE, undefined, {
+            type: 'connect-error',
+            stream: streamName,
+            serverUrl: serverUrl,
+            attempt: retryCount + 1,
+            error: e && e.message ? e.message : String(e),
+            errorName: e && e.name ? e.name : null,
+            errorStack: e && typeof e.stack === 'string' ? e.stack.slice(0, 500) : null,
+            capabilities: RTCPC_CAPABILITIES,
+            rtcCtorPresent: !!RTCPC_CTOR
+          });
+        } catch (_) { /* ignore reporting failure */ }
         retryCount++;
         if (retryCount <= MAX_RETRIES) {
           log(`Retry ${retryCount}/${MAX_RETRIES}...`);
