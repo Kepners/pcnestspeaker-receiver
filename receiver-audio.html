@@ -32,6 +32,31 @@
     const WEBRTC_NAMESPACE = 'urn:x-cast:com.pcnestspeaker.webrtc';
 
     // ===================
+    // RTCPeerConnection capability probe (runs at script-parse time, NOT
+    // inside a Cast custom-message handler, so it captures the most permissive
+    // execution context the receiver runtime exposes).
+    // ===================
+    const RTCPC_CTOR =
+      (typeof RTCPeerConnection !== 'undefined' && RTCPeerConnection) ||
+      (typeof window !== 'undefined' && window.RTCPeerConnection) ||
+      (typeof window !== 'undefined' && window.webkitRTCPeerConnection) ||
+      (typeof globalThis !== 'undefined' && globalThis.RTCPeerConnection) ||
+      null;
+
+    const RTCPC_CAPABILITIES = {
+      directRTCPeerConnection: typeof RTCPeerConnection !== 'undefined',
+      windowRTCPeerConnection: typeof window !== 'undefined' && typeof window.RTCPeerConnection !== 'undefined',
+      webkitRTCPeerConnection: typeof window !== 'undefined' && typeof window.webkitRTCPeerConnection !== 'undefined',
+      globalThisRTCPeerConnection: typeof globalThis !== 'undefined' && typeof globalThis.RTCPeerConnection !== 'undefined',
+      mediaDevices: typeof navigator !== 'undefined' && !!navigator.mediaDevices,
+      userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown',
+      castFrameworkVersion: (typeof cast !== 'undefined' && cast.framework && cast.framework.VERSION) || 'unknown',
+      probeTimestamp: new Date().toISOString()
+    };
+
+    console.log('[Probe] RTCPC capabilities:', JSON.stringify(RTCPC_CAPABILITIES));
+
+    // ===================
     // Cast Framework Setup
     // ===================
     const context = cast.framework.CastReceiverContext.getInstance();
@@ -174,7 +199,13 @@
       }
 
       const iceConfig = { iceServers: [], iceTransportPolicy: 'all' };
-      peerConnection = new RTCPeerConnection(iceConfig);
+
+      if (!RTCPC_CTOR) {
+        const err = new Error('No RTCPeerConnection constructor available in receiver runtime');
+        err.capabilities = RTCPC_CAPABILITIES;
+        throw err;
+      }
+      peerConnection = new RTCPC_CTOR(iceConfig);
 
       peerConnection.ontrack = (event) => {
         console.log('[WebRTC] Track received:', event.track.kind);
@@ -296,7 +327,11 @@
         context.sendCustomMessage(WEBRTC_NAMESPACE, undefined, {
           type: 'offer-error',
           stream: streamName,
-          error: e.message
+          error: e.message,
+          errorName: e.name || null,
+          errorStack: typeof e.stack === 'string' ? e.stack.slice(0, 500) : null,
+          capabilities: RTCPC_CAPABILITIES,
+          rtcCtorPresent: !!RTCPC_CTOR
         });
         log('Connection failed');
       }
@@ -471,6 +506,19 @@
         [WEBRTC_NAMESPACE]: cast.framework.system.MessageType.JSON
       }
     });
+
+    // Send capability probe to PC once a sender is connected so the PC can log
+    // what's actually available on this receiver runtime, even before any
+    // stream attempt. PC side may ignore this message type if not handled.
+    try {
+      context.sendCustomMessage(WEBRTC_NAMESPACE, undefined, {
+        type: 'capability-probe',
+        capabilities: RTCPC_CAPABILITIES,
+        rtcCtorPresent: !!RTCPC_CTOR
+      });
+    } catch (probeErr) {
+      console.warn('[Probe] sendCustomMessage at startup failed:', probeErr && probeErr.message);
+    }
 
     log('Waiting for connection...');
   </script>
