@@ -420,19 +420,59 @@
           wsSourceOpen = true;
           console.log('[WS] MediaSource ready, opus SourceBuffer attached');
           flushAppendQueue();
-          // Keep buffered window tiny to stay near live edge
+
+          // Aggressive live-edge tracking. Cast's media element wants to play
+          // from buffered start; we must SEEK to near the live edge or we
+          // accumulate the entire startup buffer as latency (~5-6 seconds).
+          let firstSeekDone = false;
+          const TARGET_LATENCY = 0.25; // seconds behind live edge
+          const MAX_DRIFT = 0.6;        // resync if drift exceeds this
+          const CATCHUP_RATE = 1.10;    // ~10% faster to gradually catch up
+          const NORMAL_RATE = 1.0;
+
           wsSourceBuffer.addEventListener('updateend', () => {
             flushAppendQueue();
-            // Trim anything older than 2s behind current playback time
             try {
-              if (wsSourceBuffer.buffered.length > 0 && !wsSourceBuffer.updating) {
-                const start = wsSourceBuffer.buffered.start(0);
-                const cur = audioEl.currentTime;
-                if (cur - start > 2) {
-                  wsSourceBuffer.remove(start, cur - 1);
+              if (!wsSourceBuffer || wsSourceBuffer.updating) return;
+              if (wsSourceBuffer.buffered.length === 0) return;
+
+              const bufStart = wsSourceBuffer.buffered.start(0);
+              const bufEnd = wsSourceBuffer.buffered.end(0);
+              const cur = audioEl.currentTime;
+              const driftFromLive = bufEnd - cur;
+
+              // First time we have audio: jump straight to live edge
+              if (!firstSeekDone && bufEnd - bufStart > 0.1) {
+                const target = Math.max(bufStart, bufEnd - TARGET_LATENCY);
+                if (Math.abs(audioEl.currentTime - target) > 0.05) {
+                  audioEl.currentTime = target;
+                  console.log('[WS] First seek to live edge:', target.toFixed(3),
+                              'buffered=[' + bufStart.toFixed(2) + ',' + bufEnd.toFixed(2) + ']');
                 }
+                firstSeekDone = true;
               }
-            } catch (e) {}
+              // Already running: snap forward if we drifted too far behind
+              else if (driftFromLive > MAX_DRIFT) {
+                const target = Math.max(bufStart, bufEnd - TARGET_LATENCY);
+                audioEl.currentTime = target;
+                console.warn('[WS] Drift', driftFromLive.toFixed(2), 's — seeking to live edge', target.toFixed(3));
+              }
+              // Mild drift: speed up slightly to catch up gradually (avoids audible glitch)
+              else if (driftFromLive > TARGET_LATENCY * 1.5) {
+                if (audioEl.playbackRate !== CATCHUP_RATE) {
+                  audioEl.playbackRate = CATCHUP_RATE;
+                }
+              } else if (driftFromLive < TARGET_LATENCY * 1.1 && audioEl.playbackRate !== NORMAL_RATE) {
+                audioEl.playbackRate = NORMAL_RATE;
+              }
+
+              // Trim old samples to keep memory bounded (anything > 2s behind)
+              if (cur - bufStart > 2) {
+                wsSourceBuffer.remove(bufStart, cur - 1);
+              }
+            } catch (e) {
+              console.warn('[WS] updateend handler error:', e && e.message);
+            }
           });
         } catch (e) {
           console.error('[WS] addSourceBuffer error:', e);
