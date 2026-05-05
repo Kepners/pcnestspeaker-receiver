@@ -384,101 +384,46 @@
     }
 
     // ===================
-    // LOW-LATENCY MODE: WebSocket + WebM/Opus via MediaSource Extensions
-    // PC sends FFmpeg-generated WebM/Opus clusters (~20-40 ms each) over WebSocket.
-    // Receiver feeds them straight into a MediaSource SourceBuffer that backs an
-    // <audio> element. Bypasses Cast's media-info LIVE buffer entirely.
-    // Bandwidth: 128 kbps (Opus) vs ~1.5 Mbps (raw PCM). Latency target: ~150-300 ms.
+    // LOW-LATENCY MODE: WebSocket + raw PCM scheduled on AudioContext
+    // Bypasses MediaSource entirely (MSE has a 3-5s implicit start buffer).
+    // PC pipes raw 16-bit s16le PCM at 48 kHz stereo over WebSocket in fixed
+    // 20 ms frames (3840 bytes). Receiver schedules each frame on the
+    // AudioContext clock for sample-accurate playback.
+    // Latency target: ~80-200 ms. Bandwidth ~1.5 Mbps (LAN-only, fine).
     // ===================
     let wsConnection = null;
-    let wsMediaSource = null;
-    let wsSourceBuffer = null;
-    let wsObjectUrl = null;
-    let wsAppendQueue = [];
-    let wsSourceOpen = false;
+    let wsAudioCtx = null;
+    let wsNextStartTime = 0;
+    let wsChunksScheduled = 0;
+    const WS_PCM_SAMPLE_RATE = 48000;
+    const WS_PCM_CHANNELS = 2;
+    const WS_TARGET_HEAD = 0.06;     // start ~60 ms ahead of currentTime
+    const WS_RESYNC_THRESHOLD = 0.5; // jump back to live edge if scheduled queue exceeds this
 
     function connectWebSocket(wsUrl) {
-      log('Connecting WebSocket (low-latency Opus)...');
+      log('Connecting WebSocket (raw PCM, low-latency)...');
       currentMode = 'ws';
 
-      // Stop existing playback
+      // Tear down any prior playback
       disconnect();
 
-      // Use the existing webrtc-audio element as the MediaSource sink
-      const audioEl = webrtcAudio;
-      wsMediaSource = new MediaSource();
-      wsObjectUrl = URL.createObjectURL(wsMediaSource);
-      audioEl.src = wsObjectUrl;
-      wsAppendQueue = [];
-      wsSourceOpen = false;
+      try {
+        wsAudioCtx = new (window.AudioContext || window.webkitAudioContext)({
+          sampleRate: WS_PCM_SAMPLE_RATE,
+          latencyHint: 'interactive'
+        });
+      } catch (e) {
+        console.error('[WS] AudioContext create failed:', e);
+        log('AudioContext unavailable');
+        return;
+      }
 
-      wsMediaSource.addEventListener('sourceopen', () => {
-        if (wsMediaSource.readyState !== 'open') return;
-        try {
-          wsSourceBuffer = wsMediaSource.addSourceBuffer('audio/webm; codecs="opus"');
-          wsSourceBuffer.mode = 'sequence';
-          wsSourceOpen = true;
-          console.log('[WS] MediaSource ready, opus SourceBuffer attached');
-          flushAppendQueue();
+      // Mute the <audio> element we used for HLS/WebRTC so it doesn't compete
+      try { webrtcAudio.pause(); webrtcAudio.removeAttribute('src'); webrtcAudio.load(); } catch (e) {}
+      try { hlsAudio.pause(); hlsAudio.removeAttribute('src'); hlsAudio.load(); } catch (e) {}
 
-          // Aggressive live-edge tracking. Cast's media element wants to play
-          // from buffered start; we must SEEK to near the live edge or we
-          // accumulate the entire startup buffer as latency (~5-6 seconds).
-          let firstSeekDone = false;
-          const TARGET_LATENCY = 0.25; // seconds behind live edge
-          const MAX_DRIFT = 0.6;        // resync if drift exceeds this
-          const CATCHUP_RATE = 1.10;    // ~10% faster to gradually catch up
-          const NORMAL_RATE = 1.0;
-
-          wsSourceBuffer.addEventListener('updateend', () => {
-            flushAppendQueue();
-            try {
-              if (!wsSourceBuffer || wsSourceBuffer.updating) return;
-              if (wsSourceBuffer.buffered.length === 0) return;
-
-              const bufStart = wsSourceBuffer.buffered.start(0);
-              const bufEnd = wsSourceBuffer.buffered.end(0);
-              const cur = audioEl.currentTime;
-              const driftFromLive = bufEnd - cur;
-
-              // First time we have audio: jump straight to live edge
-              if (!firstSeekDone && bufEnd - bufStart > 0.1) {
-                const target = Math.max(bufStart, bufEnd - TARGET_LATENCY);
-                if (Math.abs(audioEl.currentTime - target) > 0.05) {
-                  audioEl.currentTime = target;
-                  console.log('[WS] First seek to live edge:', target.toFixed(3),
-                              'buffered=[' + bufStart.toFixed(2) + ',' + bufEnd.toFixed(2) + ']');
-                }
-                firstSeekDone = true;
-              }
-              // Already running: snap forward if we drifted too far behind
-              else if (driftFromLive > MAX_DRIFT) {
-                const target = Math.max(bufStart, bufEnd - TARGET_LATENCY);
-                audioEl.currentTime = target;
-                console.warn('[WS] Drift', driftFromLive.toFixed(2), 's — seeking to live edge', target.toFixed(3));
-              }
-              // Mild drift: speed up slightly to catch up gradually (avoids audible glitch)
-              else if (driftFromLive > TARGET_LATENCY * 1.5) {
-                if (audioEl.playbackRate !== CATCHUP_RATE) {
-                  audioEl.playbackRate = CATCHUP_RATE;
-                }
-              } else if (driftFromLive < TARGET_LATENCY * 1.1 && audioEl.playbackRate !== NORMAL_RATE) {
-                audioEl.playbackRate = NORMAL_RATE;
-              }
-
-              // Trim old samples to keep memory bounded (anything > 2s behind)
-              if (cur - bufStart > 2) {
-                wsSourceBuffer.remove(bufStart, cur - 1);
-              }
-            } catch (e) {
-              console.warn('[WS] updateend handler error:', e && e.message);
-            }
-          });
-        } catch (e) {
-          console.error('[WS] addSourceBuffer error:', e);
-          log('Opus SourceBuffer unsupported');
-        }
-      });
+      wsNextStartTime = wsAudioCtx.currentTime + WS_TARGET_HEAD;
+      wsChunksScheduled = 0;
 
       try {
         wsConnection = new WebSocket(wsUrl);
@@ -490,18 +435,59 @@
       }
 
       wsConnection.onopen = () => {
-        console.log('[WS] Connected to', wsUrl);
+        console.log('[WS] Connected to', wsUrl, 'sampleRate=', WS_PCM_SAMPLE_RATE, 'channels=', WS_PCM_CHANNELS);
         log('Streaming audio (low-latency)...');
-        // Cast Audio runtime usually allows autoplay for cast-launched receivers
-        audioEl.play().catch(err => console.warn('[WS] play() rejected:', err && err.message));
+        // AudioContext can be in 'suspended' state on receiver until user gesture;
+        // Cast SDK launches usually grant audio autoplay.
+        if (wsAudioCtx.state === 'suspended') {
+          wsAudioCtx.resume().catch(e => console.warn('[WS] resume() failed:', e && e.message));
+        }
       };
 
       wsConnection.onmessage = (event) => {
-        const data = event.data;
-        if (!(data instanceof ArrayBuffer)) return;
-        const chunk = new Uint8Array(data);
-        wsAppendQueue.push(chunk);
-        flushAppendQueue();
+        if (!wsAudioCtx || wsAudioCtx.state === 'closed') return;
+        const buf = event.data;
+        if (!(buf instanceof ArrayBuffer)) return;
+        if (buf.byteLength < 4) return;
+
+        // 16-bit signed little-endian PCM, interleaved stereo
+        const pcm16 = new Int16Array(buf);
+        const samplesPerChannel = pcm16.length / WS_PCM_CHANNELS;
+        if (samplesPerChannel < 1) return;
+
+        const audioBuffer = wsAudioCtx.createBuffer(WS_PCM_CHANNELS, samplesPerChannel, WS_PCM_SAMPLE_RATE);
+        for (let ch = 0; ch < WS_PCM_CHANNELS; ch++) {
+          const channelData = audioBuffer.getChannelData(ch);
+          for (let i = 0; i < samplesPerChannel; i++) {
+            channelData[i] = pcm16[i * WS_PCM_CHANNELS + ch] / 32768;
+          }
+        }
+
+        const now = wsAudioCtx.currentTime;
+
+        // If the schedule head has run away from current time (we accumulated too
+        // much), snap back to live edge. Avoids creeping latency from CPU stalls.
+        if (wsNextStartTime - now > WS_RESYNC_THRESHOLD) {
+          console.warn('[WS] Schedule head', (wsNextStartTime - now).toFixed(3),
+                       's ahead — resyncing to live edge');
+          wsNextStartTime = now + WS_TARGET_HEAD;
+        }
+
+        // If we underran (chunks arrived too slowly), reset to live edge with a
+        // small look-ahead so the next chunk doesn't glitch.
+        if (wsNextStartTime < now) {
+          if (wsChunksScheduled > 0) {
+            console.warn('[WS] Buffer underrun, drift=', (now - wsNextStartTime).toFixed(3));
+          }
+          wsNextStartTime = now + WS_TARGET_HEAD;
+        }
+
+        const source = wsAudioCtx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(wsAudioCtx.destination);
+        source.start(wsNextStartTime);
+        wsNextStartTime += audioBuffer.duration;
+        wsChunksScheduled++;
       };
 
       wsConnection.onerror = (err) => {
@@ -515,35 +501,17 @@
       };
     }
 
-    function flushAppendQueue() {
-      if (!wsSourceOpen || !wsSourceBuffer || wsSourceBuffer.updating) return;
-      if (wsAppendQueue.length === 0) return;
-      try {
-        const next = wsAppendQueue.shift();
-        wsSourceBuffer.appendBuffer(next);
-      } catch (e) {
-        // SourceBuffer can throw QuotaExceeded; drop and continue
-        console.warn('[WS] appendBuffer threw, dropping chunk:', e && e.message);
-      }
-    }
-
     function disconnectWebSocket() {
       if (wsConnection) {
         try { wsConnection.close(); } catch (e) {}
         wsConnection = null;
       }
-      if (wsSourceBuffer && wsMediaSource && wsMediaSource.readyState === 'open') {
-        try { wsMediaSource.endOfStream(); } catch (e) {}
+      if (wsAudioCtx) {
+        try { wsAudioCtx.close(); } catch (e) {}
+        wsAudioCtx = null;
       }
-      if (wsObjectUrl) {
-        try { URL.revokeObjectURL(wsObjectUrl); } catch (e) {}
-        wsObjectUrl = null;
-      }
-      wsSourceBuffer = null;
-      wsMediaSource = null;
-      wsAppendQueue = [];
-      wsSourceOpen = false;
-      try { webrtcAudio.pause(); webrtcAudio.removeAttribute('src'); webrtcAudio.load(); } catch (e) {}
+      wsNextStartTime = 0;
+      wsChunksScheduled = 0;
     }
 
     // Wrap the existing disconnect to also tear down WebSocket
