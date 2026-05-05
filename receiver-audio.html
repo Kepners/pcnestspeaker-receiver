@@ -514,6 +514,165 @@
       wsChunksScheduled = 0;
     }
 
+    // ===================
+    // HTTP-PCM MODE: Same idea as ws above, but transport is HTTP chunked instead
+    // of WebSocket. Cast Audio runtime blocks ws:// from the HTTPS receiver page,
+    // but HTTP fetch to a private LAN IP IS allowed (proven by MediaMTX WHEP).
+    // PC sends raw 16-bit s16le PCM @ 48 kHz stereo as a chunked HTTP response.
+    // Receiver consumes via fetch().body.getReader() and schedules each frame.
+    // ===================
+    let pcmAbort = null;
+    let pcmAudioCtx = null;
+    let pcmNextStartTime = 0;
+    let pcmChunksScheduled = 0;
+    let pcmLeftover = new Uint8Array(0);
+    const PCM_SAMPLE_RATE = 48000;
+    const PCM_CHANNELS = 2;
+    const PCM_FRAME_BYTES = 3840; // 20 ms @ 48k stereo s16le
+    const PCM_TARGET_HEAD = 0.06;
+    const PCM_RESYNC_THRESHOLD = 0.5;
+
+    function disconnectHttpPcm() {
+      if (pcmAbort) {
+        try { pcmAbort.abort(); } catch (e) {}
+        pcmAbort = null;
+      }
+      if (pcmAudioCtx) {
+        try { pcmAudioCtx.close(); } catch (e) {}
+        pcmAudioCtx = null;
+      }
+      pcmNextStartTime = 0;
+      pcmChunksScheduled = 0;
+      pcmLeftover = new Uint8Array(0);
+    }
+
+    function schedulePcmFrame(frameBytes) {
+      if (!pcmAudioCtx || pcmAudioCtx.state === 'closed') return;
+      // Cast Chromium's fetch ReadableStream chunks aren't aligned to PCM frames;
+      // we accumulate then slice into FRAME_BYTES-sized AudioBuffers.
+      const samplesPerChannel = frameBytes.length / 2 / PCM_CHANNELS;
+      if (samplesPerChannel < 1) return;
+
+      // Interpret as Int16 little-endian
+      const dv = new DataView(frameBytes.buffer, frameBytes.byteOffset, frameBytes.byteLength);
+      const audioBuffer = pcmAudioCtx.createBuffer(PCM_CHANNELS, samplesPerChannel, PCM_SAMPLE_RATE);
+      for (let ch = 0; ch < PCM_CHANNELS; ch++) {
+        const channelData = audioBuffer.getChannelData(ch);
+        for (let i = 0; i < samplesPerChannel; i++) {
+          const sample = dv.getInt16((i * PCM_CHANNELS + ch) * 2, true);
+          channelData[i] = sample / 32768;
+        }
+      }
+
+      const now = pcmAudioCtx.currentTime;
+      if (pcmNextStartTime - now > PCM_RESYNC_THRESHOLD) {
+        console.warn('[PCM] Schedule head', (pcmNextStartTime - now).toFixed(3), 's ahead — resyncing');
+        pcmNextStartTime = now + PCM_TARGET_HEAD;
+      }
+      if (pcmNextStartTime < now) {
+        if (pcmChunksScheduled > 0) {
+          console.warn('[PCM] Underrun, drift=', (now - pcmNextStartTime).toFixed(3));
+        }
+        pcmNextStartTime = now + PCM_TARGET_HEAD;
+      }
+
+      const source = pcmAudioCtx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(pcmAudioCtx.destination);
+      source.start(pcmNextStartTime);
+      pcmNextStartTime += audioBuffer.duration;
+      pcmChunksScheduled++;
+    }
+
+    function pumpPcmChunk(uint8) {
+      // Concatenate with leftover, slice into 20 ms frames, push remainder back
+      const combined = new Uint8Array(pcmLeftover.length + uint8.length);
+      combined.set(pcmLeftover, 0);
+      combined.set(uint8, pcmLeftover.length);
+      let offset = 0;
+      while (offset + PCM_FRAME_BYTES <= combined.length) {
+        const frame = combined.subarray(offset, offset + PCM_FRAME_BYTES);
+        schedulePcmFrame(frame);
+        offset += PCM_FRAME_BYTES;
+      }
+      pcmLeftover = combined.subarray(offset);
+    }
+
+    async function connectHttpPcm(httpUrl) {
+      log('Connecting HTTP PCM (low-latency)...');
+      currentMode = 'http-pcm';
+
+      // Tear down any prior playback
+      disconnect();
+
+      try {
+        pcmAudioCtx = new (window.AudioContext || window.webkitAudioContext)({
+          sampleRate: PCM_SAMPLE_RATE,
+          latencyHint: 'interactive'
+        });
+      } catch (e) {
+        console.error('[PCM] AudioContext create failed:', e);
+        log('AudioContext unavailable');
+        return;
+      }
+      try { webrtcAudio.pause(); webrtcAudio.removeAttribute('src'); webrtcAudio.load(); } catch (e) {}
+      try { hlsAudio.pause(); hlsAudio.removeAttribute('src'); hlsAudio.load(); } catch (e) {}
+
+      pcmNextStartTime = pcmAudioCtx.currentTime + PCM_TARGET_HEAD;
+      pcmChunksScheduled = 0;
+      pcmLeftover = new Uint8Array(0);
+
+      pcmAbort = new AbortController();
+
+      try {
+        if (pcmAudioCtx.state === 'suspended') {
+          await pcmAudioCtx.resume();
+        }
+
+        console.log('[PCM] fetch', httpUrl);
+        const response = await fetch(httpUrl, {
+          method: 'GET',
+          mode: 'cors',
+          signal: pcmAbort.signal,
+          cache: 'no-store',
+          credentials: 'omit'
+        });
+
+        if (!response.ok) {
+          console.error('[PCM] HTTP', response.status);
+          log('HTTP error ' + response.status);
+          return;
+        }
+        log('Streaming audio (low-latency)...');
+
+        const reader = response.body.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            console.log('[PCM] stream ended');
+            break;
+          }
+          if (value && value.length > 0) {
+            pumpPcmChunk(value);
+          }
+        }
+      } catch (e) {
+        if (e.name === 'AbortError') {
+          console.log('[PCM] aborted');
+        } else {
+          console.error('[PCM] fetch error:', e);
+          log('PCM stream error');
+        }
+      }
+    }
+
+    // Wrap disconnect again to also tear down http-pcm
+    const _disconnectInnerWs = disconnect;
+    disconnect = function() {
+      disconnectHttpPcm();
+      _disconnectInnerWs();
+    };
+
     // Wrap the existing disconnect to also tear down WebSocket
     const _disconnectWebRtcOrHls = disconnect;
     disconnect = function() {
@@ -541,9 +700,17 @@
           if (data.url) connectHLS(data.url);
           break;
         case 'ws':
-          // Low-latency WebSocket + Web Audio API mode
+          // Low-latency WebSocket + Web Audio API mode (likely blocked by Cast
+          // mixed-content rules; left in place for testing)
           if (data.url) {
             connectWebSocket(data.url, data.sampleRate || 48000, data.channels || 2);
+          }
+          break;
+        case 'http-pcm':
+          // Low-latency HTTP PCM stream (works because HTTP fetch to private IPs
+          // is allowed from the HTTPS receiver page on Cast Audio runtime)
+          if (data.url) {
+            connectHttpPcm(data.url);
           }
           break;
         case 'disconnect':
