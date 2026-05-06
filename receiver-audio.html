@@ -575,8 +575,270 @@
       }
     }
 
+    // 1.5.6: MSE+SourceBuffer path — control the buffer ourselves so we can
+    // trim old data with sb.remove() and seek closer to live edge than the
+    // native <audio> element's opaque jitter buffer allows.
+    //
+    // Throws on any failure path so the caller can fall back to plain <audio>.
+    // Watchdog: if no bytes arrive within FIRST_BYTE_TIMEOUT_MS we abort and
+    // throw so the caller can fall back. This matches the historical
+    // observation that fetch().body.getReader() sometimes never resolves
+    // headers on Cast Audio Chromium.
+    async function connectHttpPcmMse(httpUrl) {
+      reportPcmStatus('mse-attempt', httpUrl);
+      const FIRST_BYTE_TIMEOUT_MS = 3500;
+      const SOURCE_OPEN_TIMEOUT_MS = 4000;
+      const TARGET_LATENCY = 0.20;   // seek to within 200 ms of live edge
+      const SOFT_LAG = 0.40;
+      const HARD_LAG = 0.80;
+      const TRIM_KEEP_BEHIND = 0.50; // keep 0.5 s of history buffered
+
+      const audioEl = webrtcAudio;
+      try { hlsAudio.pause(); hlsAudio.removeAttribute('src'); hlsAudio.load(); } catch (e) {}
+
+      audioEl.preload = 'auto';
+      audioEl.crossOrigin = 'anonymous';
+
+      // Wire native media events into the same status stream we use for the
+      // <audio> path so the desktop log can compare apples to apples.
+      const events = ['loadstart','loadedmetadata','loadeddata','canplay','canplaythrough','playing','waiting','stalled','suspend','ended','error','emptied'];
+      events.forEach(ev => {
+        audioEl.addEventListener(ev, function () {
+          let detail;
+          if (ev === 'error') {
+            const me = audioEl.error;
+            detail = me ? `code=${me.code} msg=${me.message}` : 'unknown';
+          } else {
+            detail = 'ct=' + (audioEl.currentTime || 0).toFixed(2) + ' rs=' + audioEl.readyState +
+                     ' bufLen=' + audioEl.buffered.length;
+            if (audioEl.buffered.length > 0) {
+              detail += ' bufEnd=' + audioEl.buffered.end(audioEl.buffered.length - 1).toFixed(2);
+            }
+          }
+          reportPcmStatus('mse-' + ev, detail);
+          if (ev === 'playing') reportPcmStatus('playing', detail);
+        });
+      });
+
+      const ms = new MediaSource();
+      pcmMediaSource = ms;
+      pcmObjectUrl = URL.createObjectURL(ms);
+      audioEl.src = pcmObjectUrl;
+      reportPcmStatus('mse-src-set', 'objectUrl');
+
+      // Wait for sourceopen with a timeout
+      await new Promise((resolve, reject) => {
+        let done = false;
+        const onOpen = () => {
+          if (done) return;
+          done = true;
+          ms.removeEventListener('sourceopen', onOpen);
+          resolve();
+        };
+        ms.addEventListener('sourceopen', onOpen);
+        setTimeout(() => {
+          if (!done) { done = true; reject(new Error('sourceopen timeout ' + SOURCE_OPEN_TIMEOUT_MS + 'ms')); }
+        }, SOURCE_OPEN_TIMEOUT_MS);
+      });
+
+      reportPcmStatus('mse-sourceopen', 'readyState=' + ms.readyState);
+
+      const sb = ms.addSourceBuffer('audio/webm; codecs="opus"');
+      sb.mode = 'sequence';
+      pcmSourceBuffer = sb;
+      pcmAppendQueue = [];
+      reportPcmStatus('mse-sb-added', 'mode=' + sb.mode);
+
+      sb.addEventListener('updateend', () => {
+        // Drain queue
+        if (pcmAppendQueue.length > 0 && !sb.updating) {
+          try { sb.appendBuffer(pcmAppendQueue.shift()); }
+          catch (e) { reportPcmStatus('mse-append-err', e && e.message); }
+        }
+      });
+
+      // Fetch with reader — same shape as before but with a strict
+      // first-byte watchdog. If it doesn't deliver, throw so caller falls back.
+      pcmAbort = new AbortController();
+      reportPcmStatus('mse-fetch-start', '');
+
+      let resp;
+      try {
+        resp = await fetch(httpUrl, {
+          signal: pcmAbort.signal,
+          cache: 'no-store',
+          credentials: 'omit'
+        });
+      } catch (e) {
+        throw new Error('fetch threw: ' + (e && e.message));
+      }
+      if (!resp.ok || !resp.body) throw new Error('fetch resp not ok ' + resp.status);
+      reportPcmStatus('mse-fetch-headers', 'status=' + resp.status);
+
+      const reader = resp.body.getReader();
+      let bytesReceived = 0;
+      let firstByteAt = 0;
+      let firstByteResolve, firstByteReject;
+      const firstByteSignal = new Promise((res, rej) => { firstByteResolve = res; firstByteReject = rej; });
+      const firstByteTimer = setTimeout(() => {
+        if (!firstByteAt) {
+          try { pcmAbort.abort(); } catch (_) {}
+          firstByteReject(new Error('first-byte watchdog ' + FIRST_BYTE_TIMEOUT_MS + 'ms'));
+        }
+      }, FIRST_BYTE_TIMEOUT_MS);
+
+      // Pump runs in background; first-byte arrival is the gate that lets us
+      // proceed (start the drift loop, etc.). All errors during pump are
+      // logged but don't propagate after first-byte (already past fallback gate).
+      (async () => {
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) {
+              reportPcmStatus('mse-reader-done', 'bytes=' + bytesReceived);
+              break;
+            }
+            if (!value || value.length === 0) continue;
+            bytesReceived += value.length;
+            if (!firstByteAt) {
+              firstByteAt = Date.now();
+              clearTimeout(firstByteTimer);
+              reportPcmStatus('mse-first-byte', 'len=' + value.length);
+              firstByteResolve();
+            }
+            // Append (or queue if SB busy)
+            if (sb.updating || pcmAppendQueue.length > 0) {
+              pcmAppendQueue.push(value);
+            } else {
+              try { sb.appendBuffer(value); }
+              catch (e) {
+                if (e && e.name === 'QuotaExceededError') {
+                  // Buffer full — trim and retry
+                  try {
+                    if (sb.buffered.length > 0) {
+                      const removeEnd = Math.max(sb.buffered.start(0) + 0.1, audioEl.currentTime - 0.5);
+                      if (removeEnd > sb.buffered.start(0)) {
+                        sb.remove(sb.buffered.start(0), removeEnd);
+                        pcmAppendQueue.unshift(value);
+                      }
+                    }
+                  } catch (_) {}
+                } else {
+                  reportPcmStatus('mse-append-err', e && e.message);
+                }
+              }
+            }
+          }
+        } catch (e) {
+          reportPcmStatus('mse-pump-err', e && e.message);
+        }
+      })();
+
+      // Block here until first byte arrives (or watchdog throws)
+      await firstByteSignal;
+
+      // Now start playback. Native <audio> may auto-play once it sees data via
+      // the MediaSource — call play() explicitly anyway for the platforms
+      // that need it.
+      try {
+        await audioEl.play();
+        reportPcmStatus('mse-play-resolved', 'ct=' + audioEl.currentTime.toFixed(2));
+      } catch (e) {
+        reportPcmStatus('mse-play-rejected', (e && e.name) + ': ' + (e && e.message));
+      }
+
+      // Drift loop — trim old data, seek to live edge if we fall behind.
+      let lastDriftReport = 0;
+      let probeSent = false;
+
+      if (pcmDriftTimer) { try { clearInterval(pcmDriftTimer); } catch (_) {} }
+      pcmDriftTimer = setInterval(() => {
+        if (currentMode !== 'http-pcm') {
+          clearInterval(pcmDriftTimer);
+          pcmDriftTimer = null;
+          return;
+        }
+        if (!sb || !ms || ms.readyState !== 'open') return;
+        if (audioEl.readyState < 2) return;
+        if (sb.buffered.length === 0) return;
+
+        const liveEdge = sb.buffered.end(sb.buffered.length - 1);
+        const cur = audioEl.currentTime;
+        const lag = liveEdge - cur;
+        const now = Date.now();
+
+        // Trim old data. Only call remove() when SB is idle and there's
+        // actually room to free (avoid pointless updateend churn).
+        if (!sb.updating && cur > TRIM_KEEP_BEHIND) {
+          const trimEnd = cur - TRIM_KEEP_BEHIND;
+          if (sb.buffered.start(0) + 0.05 < trimEnd) {
+            try { sb.remove(sb.buffered.start(0), trimEnd); } catch (_) {}
+          }
+        }
+
+        // One-shot probe — does seek actually move the playhead inside the
+        // MSE buffer? If yes we're past the historical floor; if no we'll
+        // need RTP later.
+        if (!probeSent && lag > 0.5) {
+          probeSent = true;
+          const before = cur;
+          const target = liveEdge - TARGET_LATENCY;
+          let method = 'currentTime';
+          try {
+            if (typeof audioEl.fastSeek === 'function') {
+              audioEl.fastSeek(target);
+              method = 'fastSeek';
+            } else {
+              audioEl.currentTime = target;
+            }
+          } catch (e) {}
+          setTimeout(() => {
+            const after = audioEl.currentTime;
+            const works = Math.abs(after - target) < 0.15;
+            reportPcmStatus('mse-seek-probe', JSON.stringify({
+              method,
+              seekable_length: audioEl.seekable.length,
+              seekable_start: audioEl.seekable.length > 0 ? audioEl.seekable.start(0) : null,
+              seekable_end: audioEl.seekable.length > 0 ? audioEl.seekable.end(audioEl.seekable.length - 1) : null,
+              buffered_start: sb.buffered.length > 0 ? sb.buffered.start(0) : null,
+              buffered_end: liveEdge,
+              ct_before: before,
+              ct_after: after,
+              target,
+              seek_works: works
+            }));
+          }, 120);
+        }
+
+        if (lag > HARD_LAG) {
+          const target = liveEdge - TARGET_LATENCY;
+          try {
+            if (typeof audioEl.fastSeek === 'function') audioEl.fastSeek(target);
+            else audioEl.currentTime = target;
+          } catch (_) {}
+          if (now - lastDriftReport > 1000) {
+            reportPcmStatus('mse-drift-resync', 'lag=' + lag.toFixed(2) + 's seek→' + target.toFixed(2));
+            lastDriftReport = now;
+          }
+          audioEl.playbackRate = 1.0;
+        } else if (lag > SOFT_LAG) {
+          if (audioEl.playbackRate !== 1.05) {
+            audioEl.playbackRate = 1.05;
+            if (now - lastDriftReport > 1500) {
+              reportPcmStatus('mse-drift-catchup', 'lag=' + lag.toFixed(2) + 's 1.05x');
+              lastDriftReport = now;
+            }
+          }
+        } else if (lag < TARGET_LATENCY * 1.4 && audioEl.playbackRate !== 1.0) {
+          audioEl.playbackRate = 1.0;
+        }
+      }, 250);
+
+      reportPcmStatus('mse-active', 'TARGET_LATENCY=' + TARGET_LATENCY);
+    }
+
     async function connectHttpPcm(httpUrl) {
-      log('Connecting WebM/Opus stream (direct)...');
+      log('Connecting WebM/Opus stream...');
       currentMode = 'http-pcm';
       reportPcmStatus('handler-entered', 'url=' + httpUrl);
       disconnect();
@@ -596,15 +858,34 @@
         caps.audio_canPlay_webm_opus = audioProbe.canPlayType('audio/webm; codecs="opus"');
         caps.audio_canPlay_mp3 = audioProbe.canPlayType('audio/mpeg');
         caps.audio_canPlay_aac = audioProbe.canPlayType('audio/mp4; codecs="mp4a.40.2"');
+        try {
+          caps.mse_isTypeSupported_webm_opus = (typeof MediaSource !== 'undefined') &&
+            MediaSource.isTypeSupported('audio/webm; codecs="opus"');
+        } catch (e) { caps.mse_typeProbeErr = e && e.message; }
       } catch (e) { caps.canPlayTypeErr = e && e.message; }
       reportPcmStatus('capabilities', JSON.stringify(caps));
 
-      // Direct <audio> element load — no MSE, no fetch+ReadableStream, no
-      // manual buffer management. fetch().body.getReader() proved unreliable
-      // on Cast Audio Chromium (request opens, headers never resolve to JS).
-      // The native audio element opens its own HTTP connection, decodes the
-      // chunked WebM/Opus stream and starts playing as soon as `canplay`
-      // fires. That's the most-tested path on Cast Audio per Google docs.
+      // 1.5.6: try MSE+SourceBuffer path first — we control the buffer and
+      // can `sb.remove()` old data + seek closer to live edge. Research
+      // (owntone, shaka-player) shows this typically cuts 300-700 ms off
+      // the <audio>-element internal jitter buffer. If MSE doesn't deliver
+      // bytes within the watchdog window, we fall back to plain <audio>.
+      if (caps.mse_isTypeSupported_webm_opus) {
+        try {
+          await connectHttpPcmMse(httpUrl);
+          return;
+        } catch (e) {
+          reportPcmStatus('mse-fallback-to-audio', (e && e.message) || String(e));
+          // Tear down whatever MSE state we created and continue to <audio> path
+          try { disconnectHttpPcm(); } catch (_) {}
+        }
+      } else {
+        reportPcmStatus('mse-skip', 'isTypeSupported=false');
+      }
+
+      // Plain <audio src> fallback. The native audio element opens its own
+      // HTTP connection, decodes the chunked WebM/Opus stream and starts
+      // playing as soon as `canplay` fires. Most-tested path on Cast Audio.
       const audioEl = webrtcAudio;
       try { hlsAudio.pause(); hlsAudio.removeAttribute('src'); hlsAudio.load(); } catch (e) {}
 
