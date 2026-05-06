@@ -657,18 +657,29 @@
         }
       });
 
-      // Fetch with reader — same shape as before but with a strict
-      // first-byte watchdog. If it doesn't deliver, throw so caller falls back.
+      // 1.5.7 fix: race fetch() itself against a hard timeout. On Cast Audio
+      // Chromium, `await fetch()` can hang indefinitely without resolving
+      // headers even though the underlying socket is delivering bytes
+      // (CLAUDE.md historical note). Without this race the function awaits
+      // forever and the caller's catch never runs → user gets no audio.
       pcmAbort = new AbortController();
       reportPcmStatus('mse-fetch-start', '');
 
+      const fetchPromise = fetch(httpUrl, {
+        signal: pcmAbort.signal,
+        cache: 'no-store',
+        credentials: 'omit'
+      });
+
+      const FETCH_TIMEOUT_MS = 2500;
+      const fetchWatchdog = new Promise((_, rej) => setTimeout(() => {
+        try { pcmAbort.abort(); } catch (_) {}
+        rej(new Error('fetch watchdog ' + FETCH_TIMEOUT_MS + 'ms'));
+      }, FETCH_TIMEOUT_MS));
+
       let resp;
       try {
-        resp = await fetch(httpUrl, {
-          signal: pcmAbort.signal,
-          cache: 'no-store',
-          credentials: 'omit'
-        });
+        resp = await Promise.race([fetchPromise, fetchWatchdog]);
       } catch (e) {
         throw new Error('fetch threw: ' + (e && e.message));
       }
@@ -871,8 +882,19 @@
       // the <audio>-element internal jitter buffer. If MSE doesn't deliver
       // bytes within the watchdog window, we fall back to plain <audio>.
       if (caps.mse_isTypeSupported_webm_opus) {
+        // 1.5.7 fix: master watchdog. Even with the inner fetch race in place,
+        // any later step (reader.read, appendBuffer, sourceopen) could in
+        // principle hang on the Cast Audio runtime. This guarantees we hit
+        // the <audio> fallback within MSE_MASTER_TIMEOUT_MS no matter what.
+        const MSE_MASTER_TIMEOUT_MS = 4000;
         try {
-          await connectHttpPcmMse(httpUrl);
+          await Promise.race([
+            connectHttpPcmMse(httpUrl),
+            new Promise((_, rej) => setTimeout(
+              () => rej(new Error('mse master watchdog ' + MSE_MASTER_TIMEOUT_MS + 'ms')),
+              MSE_MASTER_TIMEOUT_MS
+            ))
+          ]);
           return;
         } catch (e) {
           reportPcmStatus('mse-fallback-to-audio', (e && e.message) || String(e));
