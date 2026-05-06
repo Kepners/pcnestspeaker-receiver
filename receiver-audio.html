@@ -876,34 +876,17 @@
       } catch (e) { caps.canPlayTypeErr = e && e.message; }
       reportPcmStatus('capabilities', JSON.stringify(caps));
 
-      // 1.5.6: try MSE+SourceBuffer path first — we control the buffer and
-      // can `sb.remove()` old data + seek closer to live edge. Research
-      // (owntone, shaka-player) shows this typically cuts 300-700 ms off
-      // the <audio>-element internal jitter buffer. If MSE doesn't deliver
-      // bytes within the watchdog window, we fall back to plain <audio>.
-      if (caps.mse_isTypeSupported_webm_opus) {
-        // 1.5.7 fix: master watchdog. Even with the inner fetch race in place,
-        // any later step (reader.read, appendBuffer, sourceopen) could in
-        // principle hang on the Cast Audio runtime. This guarantees we hit
-        // the <audio> fallback within MSE_MASTER_TIMEOUT_MS no matter what.
-        const MSE_MASTER_TIMEOUT_MS = 4000;
-        try {
-          await Promise.race([
-            connectHttpPcmMse(httpUrl),
-            new Promise((_, rej) => setTimeout(
-              () => rej(new Error('mse master watchdog ' + MSE_MASTER_TIMEOUT_MS + 'ms')),
-              MSE_MASTER_TIMEOUT_MS
-            ))
-          ]);
-          return;
-        } catch (e) {
-          reportPcmStatus('mse-fallback-to-audio', (e && e.message) || String(e));
-          // Tear down whatever MSE state we created and continue to <audio> path
-          try { disconnectHttpPcm(); } catch (_) {}
-        }
-      } else {
-        reportPcmStatus('mse-skip', 'isTypeSupported=false');
-      }
+      // 1.5.8 EMERGENCY: MSE attempt disabled.
+      // 1.5.6/1.5.7 testing showed `await fetch()` hangs forever on this
+      // runtime even with watchdogs (the watchdog itself either doesn't
+      // run or the cached old receiver is being served). Symptoms in user
+      // logs: receiver stops at `mse-fetch-start` and never reports
+      // `mse-fallback-to-audio`. Audio is dead.
+      // Going straight to the plain <audio src=> path (which has worked
+      // since 1.5.0) until the research path ships a working alternative
+      // (likely XHR-based feeding into MSE, per Cast Audio compatibility
+      // patterns; or the owntone-style 85CDB22F + Cast RTP rewrite).
+      reportPcmStatus('mse-skip', 'mse-disabled-1.5.8');
 
       // Plain <audio src> fallback. The native audio element opens its own
       // HTTP connection, decodes the chunked WebM/Opus stream and starts
