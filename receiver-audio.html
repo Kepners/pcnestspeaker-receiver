@@ -515,87 +515,51 @@
     }
 
     // ===================
-    // HTTP-PCM MODE: Same idea as ws above, but transport is HTTP chunked instead
-    // of WebSocket. Cast Audio runtime blocks ws:// from the HTTPS receiver page,
-    // but HTTP fetch to a private LAN IP IS allowed (proven by MediaMTX WHEP).
-    // PC sends raw 16-bit s16le PCM @ 48 kHz stereo as a chunked HTTP response.
-    // Receiver consumes via fetch().body.getReader() and schedules each frame.
+    // LOW-LATENCY MODE: WebM/Opus over HTTP chunked + MediaSource Extensions.
+    //
+    // Cast for Audio runtime per Google docs:
+    //   - MediaSource Extensions: SUPPORTED
+    //   - HTMLAudioElement: SUPPORTED
+    //   - Fetch: SUPPORTED
+    //   - AudioContext: NOT supported (web API set is reduced for displayless devices)
+    //   - Codecs incl. Opus in WebM
+    //
+    // Bug fix from earlier attempt: call audio.play() ONLY AFTER the first
+    // appendBuffer has parsed (updateend fires). Calling play() before any
+    // data made <audio> default to playing from buffered start, accumulating
+    // ~6 s of latency. We now seek to live edge then play().
     // ===================
     let pcmAbort = null;
-    let pcmAudioCtx = null;
-    let pcmNextStartTime = 0;
-    let pcmChunksScheduled = 0;
-    let pcmLeftover = new Uint8Array(0);
-    const PCM_SAMPLE_RATE = 48000;
-    const PCM_CHANNELS = 2;
-    const PCM_FRAME_BYTES = 3840; // 20 ms @ 48k stereo s16le
-    const PCM_TARGET_HEAD = 0.06;
-    const PCM_RESYNC_THRESHOLD = 0.5;
+    let pcmMediaSource = null;
+    let pcmSourceBuffer = null;
+    let pcmObjectUrl = null;
+    let pcmAppendQueue = [];
+    let pcmStarted = false;
+    const PCM_TARGET_LATENCY = 0.30;
+    const PCM_MAX_DRIFT = 0.80;
+    const PCM_CATCHUP_RATE = 1.10;
+    const PCM_NORMAL_RATE = 1.0;
 
     function disconnectHttpPcm() {
-      if (pcmAbort) {
-        try { pcmAbort.abort(); } catch (e) {}
-        pcmAbort = null;
+      if (pcmAbort) { try { pcmAbort.abort(); } catch (e) {} pcmAbort = null; }
+      if (pcmSourceBuffer && pcmMediaSource && pcmMediaSource.readyState === 'open') {
+        try { pcmMediaSource.endOfStream(); } catch (e) {}
       }
-      if (pcmAudioCtx) {
-        try { pcmAudioCtx.close(); } catch (e) {}
-        pcmAudioCtx = null;
-      }
-      pcmNextStartTime = 0;
-      pcmChunksScheduled = 0;
-      pcmLeftover = new Uint8Array(0);
+      if (pcmObjectUrl) { try { URL.revokeObjectURL(pcmObjectUrl); } catch (e) {} pcmObjectUrl = null; }
+      pcmSourceBuffer = null;
+      pcmMediaSource = null;
+      pcmAppendQueue = [];
+      pcmStarted = false;
+      try { webrtcAudio.pause(); webrtcAudio.removeAttribute('src'); webrtcAudio.load(); } catch (e) {}
     }
 
-    function schedulePcmFrame(frameBytes) {
-      if (!pcmAudioCtx || pcmAudioCtx.state === 'closed') return;
-      // Cast Chromium's fetch ReadableStream chunks aren't aligned to PCM frames;
-      // we accumulate then slice into FRAME_BYTES-sized AudioBuffers.
-      const samplesPerChannel = frameBytes.length / 2 / PCM_CHANNELS;
-      if (samplesPerChannel < 1) return;
-
-      // Interpret as Int16 little-endian
-      const dv = new DataView(frameBytes.buffer, frameBytes.byteOffset, frameBytes.byteLength);
-      const audioBuffer = pcmAudioCtx.createBuffer(PCM_CHANNELS, samplesPerChannel, PCM_SAMPLE_RATE);
-      for (let ch = 0; ch < PCM_CHANNELS; ch++) {
-        const channelData = audioBuffer.getChannelData(ch);
-        for (let i = 0; i < samplesPerChannel; i++) {
-          const sample = dv.getInt16((i * PCM_CHANNELS + ch) * 2, true);
-          channelData[i] = sample / 32768;
-        }
+    function flushPcmQueue() {
+      if (!pcmSourceBuffer || pcmSourceBuffer.updating || pcmAppendQueue.length === 0) return;
+      try {
+        pcmSourceBuffer.appendBuffer(pcmAppendQueue.shift());
+      } catch (e) {
+        console.warn('[PCM] appendBuffer threw:', e && e.message);
       }
-
-      const now = pcmAudioCtx.currentTime;
-      if (pcmNextStartTime - now > PCM_RESYNC_THRESHOLD) {
-        console.warn('[PCM] Schedule head', (pcmNextStartTime - now).toFixed(3), 's ahead — resyncing');
-        pcmNextStartTime = now + PCM_TARGET_HEAD;
-      }
-      if (pcmNextStartTime < now) {
-        if (pcmChunksScheduled > 0) {
-          console.warn('[PCM] Underrun, drift=', (now - pcmNextStartTime).toFixed(3));
-        }
-        pcmNextStartTime = now + PCM_TARGET_HEAD;
-      }
-
-      const source = pcmAudioCtx.createBufferSource();
-      source.buffer = audioBuffer;
-      source.connect(pcmAudioCtx.destination);
-      source.start(pcmNextStartTime);
-      pcmNextStartTime += audioBuffer.duration;
-      pcmChunksScheduled++;
-    }
-
-    function pumpPcmChunk(uint8) {
-      // Concatenate with leftover, slice into 20 ms frames, push remainder back
-      const combined = new Uint8Array(pcmLeftover.length + uint8.length);
-      combined.set(pcmLeftover, 0);
-      combined.set(uint8, pcmLeftover.length);
-      let offset = 0;
-      while (offset + PCM_FRAME_BYTES <= combined.length) {
-        const frame = combined.subarray(offset, offset + PCM_FRAME_BYTES);
-        schedulePcmFrame(frame);
-        offset += PCM_FRAME_BYTES;
-      }
-      pcmLeftover = combined.subarray(offset);
     }
 
     function reportPcmStatus(status, detail) {
@@ -610,63 +574,115 @@
     }
 
     async function connectHttpPcm(httpUrl) {
-      log('Connecting HTTP PCM (low-latency)...');
+      log('Connecting WebM/Opus stream (low-latency)...');
       currentMode = 'http-pcm';
       reportPcmStatus('handler-entered', 'url=' + httpUrl);
-
-      // Tear down any prior playback
       disconnect();
 
-      // Capability fingerprint — tells us what APIs the runtime exposes
-      reportPcmStatus('capabilities', JSON.stringify({
+      // Comprehensive capability probe
+      const caps = {
         AudioContext: typeof AudioContext !== 'undefined' || typeof webkitAudioContext !== 'undefined',
+        MediaSource: typeof MediaSource !== 'undefined' || typeof WebKitMediaSource !== 'undefined',
+        HTMLAudioElement: typeof HTMLAudioElement !== 'undefined',
         fetch: typeof fetch !== 'undefined',
         ReadableStream: typeof ReadableStream !== 'undefined',
-        TextDecoder: typeof TextDecoder !== 'undefined',
-        AbortController: typeof AbortController !== 'undefined'
-      }));
-
+        AbortController: typeof AbortController !== 'undefined',
+        WebSocket: typeof WebSocket !== 'undefined'
+      };
       try {
-        pcmAudioCtx = new (window.AudioContext || window.webkitAudioContext)({
-          sampleRate: PCM_SAMPLE_RATE,
-          latencyHint: 'interactive'
-        });
-      } catch (e) {
-        console.error('[PCM] AudioContext create failed:', e);
-        reportPcmStatus('audio-context-failed', e && e.message);
-        log('AudioContext unavailable');
+        const MS = window.MediaSource || window.WebKitMediaSource;
+        if (MS && MS.isTypeSupported) {
+          caps.opusInWebm = MS.isTypeSupported('audio/webm; codecs="opus"');
+          caps.aacInMp4 = MS.isTypeSupported('audio/mp4; codecs="mp4a.40.2"');
+          caps.heaacInMp4 = MS.isTypeSupported('audio/mp4; codecs="mp4a.40.5"');
+        }
+      } catch (e) { caps.isTypeSupportedErr = e && e.message; }
+      reportPcmStatus('capabilities', JSON.stringify(caps));
+
+      if (!caps.MediaSource) {
+        reportPcmStatus('mse-unavailable');
+        log('MediaSource unavailable');
         return;
       }
-      reportPcmStatus('audio-context-state', pcmAudioCtx.state);
-      try { webrtcAudio.pause(); webrtcAudio.removeAttribute('src'); webrtcAudio.load(); } catch (e) {}
+      if (caps.opusInWebm === false) {
+        reportPcmStatus('opus-webm-unsupported');
+        log('audio/webm Opus not supported');
+        return;
+      }
+
+      const audioEl = webrtcAudio;
       try { hlsAudio.pause(); hlsAudio.removeAttribute('src'); hlsAudio.load(); } catch (e) {}
 
-      pcmNextStartTime = pcmAudioCtx.currentTime + PCM_TARGET_HEAD;
-      pcmChunksScheduled = 0;
-      pcmLeftover = new Uint8Array(0);
+      pcmMediaSource = new (window.MediaSource || window.WebKitMediaSource)();
+      pcmObjectUrl = URL.createObjectURL(pcmMediaSource);
+      audioEl.src = pcmObjectUrl;
+      pcmAppendQueue = [];
+      pcmStarted = false;
 
-      pcmAbort = new AbortController();
-
-      try {
-        if (pcmAudioCtx.state === 'suspended') {
-          try { await pcmAudioCtx.resume(); reportPcmStatus('audio-context-resumed', pcmAudioCtx.state); }
-          catch (e) { reportPcmStatus('audio-context-resume-failed', e && e.message); }
-        }
-
-        reportPcmStatus('fetch-start', httpUrl);
-        const response = await fetch(httpUrl, {
-          method: 'GET',
-          mode: 'cors',
-          signal: pcmAbort.signal,
-          cache: 'no-store',
-          credentials: 'omit'
-        });
-
-        reportPcmStatus('fetch-response', 'status=' + response.status + ' ok=' + response.ok);
-        if (!response.ok) {
-          log('HTTP error ' + response.status);
+      pcmMediaSource.addEventListener('sourceopen', () => {
+        if (pcmMediaSource.readyState !== 'open') return;
+        try {
+          pcmSourceBuffer = pcmMediaSource.addSourceBuffer('audio/webm; codecs="opus"');
+          pcmSourceBuffer.mode = 'sequence';
+        } catch (e) {
+          reportPcmStatus('source-buffer-failed', e && e.message);
+          log('SourceBuffer create failed');
           return;
         }
+        reportPcmStatus('source-buffer-ready');
+
+        pcmSourceBuffer.addEventListener('updateend', () => {
+          flushPcmQueue();
+          try {
+            if (!pcmSourceBuffer || pcmSourceBuffer.updating) return;
+            if (pcmSourceBuffer.buffered.length === 0) return;
+            const bufStart = pcmSourceBuffer.buffered.start(0);
+            const bufEnd = pcmSourceBuffer.buffered.end(0);
+
+            // FIRST data parsed → seek to live edge THEN play (this is the fix)
+            if (!pcmStarted && bufEnd - bufStart > 0.04) {
+              pcmStarted = true;
+              const target = Math.max(bufStart, bufEnd - PCM_TARGET_LATENCY);
+              try { audioEl.currentTime = target; } catch (e) {}
+              audioEl.play()
+                .then(() => reportPcmStatus('playing', 'currentTime=' + target.toFixed(3) + ' bufEnd=' + bufEnd.toFixed(3)))
+                .catch(e => reportPcmStatus('play-rejected', e && e.message));
+              return;
+            }
+
+            // Drift management on subsequent chunks
+            const cur = audioEl.currentTime;
+            const drift = bufEnd - cur;
+            if (drift > PCM_MAX_DRIFT) {
+              const target = Math.max(bufStart, bufEnd - PCM_TARGET_LATENCY);
+              audioEl.currentTime = target;
+              reportPcmStatus('drift-resync', 'drift=' + drift.toFixed(2) + ' → ' + target.toFixed(3));
+            } else if (drift > PCM_TARGET_LATENCY * 1.5) {
+              if (audioEl.playbackRate !== PCM_CATCHUP_RATE) audioEl.playbackRate = PCM_CATCHUP_RATE;
+            } else if (drift < PCM_TARGET_LATENCY * 1.1 && audioEl.playbackRate !== PCM_NORMAL_RATE) {
+              audioEl.playbackRate = PCM_NORMAL_RATE;
+            }
+
+            if (cur - bufStart > 2 && !pcmSourceBuffer.updating) {
+              try { pcmSourceBuffer.remove(bufStart, cur - 1); } catch (e) {}
+            }
+          } catch (e) {
+            console.warn('[PCM] updateend handler error:', e && e.message);
+          }
+        });
+
+        flushPcmQueue();
+      });
+
+      pcmAbort = new AbortController();
+      try {
+        reportPcmStatus('fetch-start', httpUrl);
+        const response = await fetch(httpUrl, {
+          method: 'GET', mode: 'cors', signal: pcmAbort.signal,
+          cache: 'no-store', credentials: 'omit'
+        });
+        reportPcmStatus('fetch-response', 'status=' + response.status + ' ok=' + response.ok + ' ct=' + response.headers.get('content-type'));
+        if (!response.ok) { log('HTTP error ' + response.status); return; }
         log('Streaming audio (low-latency)...');
 
         const reader = response.body.getReader();
@@ -684,7 +700,8 @@
               reportPcmStatus('first-chunk', 'bytes=' + value.length);
               firstChunkReported = true;
             }
-            pumpPcmChunk(value);
+            pcmAppendQueue.push(value);
+            flushPcmQueue();
           }
         }
       } catch (e) {
@@ -692,7 +709,7 @@
           reportPcmStatus('aborted');
         } else {
           reportPcmStatus('fetch-error', (e && e.name) + ': ' + (e && e.message));
-          log('PCM stream error');
+          log('Stream error');
         }
       }
     }
