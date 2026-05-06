@@ -598,12 +598,33 @@
       pcmLeftover = combined.subarray(offset);
     }
 
+    function reportPcmStatus(status, detail) {
+      try {
+        const payload = { type: 'pcm-status', status };
+        if (detail !== undefined) payload.detail = String(detail).substring(0, 300);
+        context.sendCustomMessage(WEBRTC_NAMESPACE, undefined, payload);
+        console.log('[PCM][status]', status, detail || '');
+      } catch (e) {
+        console.warn('[PCM] sendCustomMessage failed:', e && e.message);
+      }
+    }
+
     async function connectHttpPcm(httpUrl) {
       log('Connecting HTTP PCM (low-latency)...');
       currentMode = 'http-pcm';
+      reportPcmStatus('handler-entered', 'url=' + httpUrl);
 
       // Tear down any prior playback
       disconnect();
+
+      // Capability fingerprint — tells us what APIs the runtime exposes
+      reportPcmStatus('capabilities', JSON.stringify({
+        AudioContext: typeof AudioContext !== 'undefined' || typeof webkitAudioContext !== 'undefined',
+        fetch: typeof fetch !== 'undefined',
+        ReadableStream: typeof ReadableStream !== 'undefined',
+        TextDecoder: typeof TextDecoder !== 'undefined',
+        AbortController: typeof AbortController !== 'undefined'
+      }));
 
       try {
         pcmAudioCtx = new (window.AudioContext || window.webkitAudioContext)({
@@ -612,9 +633,11 @@
         });
       } catch (e) {
         console.error('[PCM] AudioContext create failed:', e);
+        reportPcmStatus('audio-context-failed', e && e.message);
         log('AudioContext unavailable');
         return;
       }
+      reportPcmStatus('audio-context-state', pcmAudioCtx.state);
       try { webrtcAudio.pause(); webrtcAudio.removeAttribute('src'); webrtcAudio.load(); } catch (e) {}
       try { hlsAudio.pause(); hlsAudio.removeAttribute('src'); hlsAudio.load(); } catch (e) {}
 
@@ -626,10 +649,11 @@
 
       try {
         if (pcmAudioCtx.state === 'suspended') {
-          await pcmAudioCtx.resume();
+          try { await pcmAudioCtx.resume(); reportPcmStatus('audio-context-resumed', pcmAudioCtx.state); }
+          catch (e) { reportPcmStatus('audio-context-resume-failed', e && e.message); }
         }
 
-        console.log('[PCM] fetch', httpUrl);
+        reportPcmStatus('fetch-start', httpUrl);
         const response = await fetch(httpUrl, {
           method: 'GET',
           mode: 'cors',
@@ -638,29 +662,36 @@
           credentials: 'omit'
         });
 
+        reportPcmStatus('fetch-response', 'status=' + response.status + ' ok=' + response.ok);
         if (!response.ok) {
-          console.error('[PCM] HTTP', response.status);
           log('HTTP error ' + response.status);
           return;
         }
         log('Streaming audio (low-latency)...');
 
         const reader = response.body.getReader();
+        let totalBytes = 0;
+        let firstChunkReported = false;
         while (true) {
           const { done, value } = await reader.read();
           if (done) {
-            console.log('[PCM] stream ended');
+            reportPcmStatus('stream-ended', 'totalBytes=' + totalBytes);
             break;
           }
           if (value && value.length > 0) {
+            totalBytes += value.length;
+            if (!firstChunkReported) {
+              reportPcmStatus('first-chunk', 'bytes=' + value.length);
+              firstChunkReported = true;
+            }
             pumpPcmChunk(value);
           }
         }
       } catch (e) {
         if (e.name === 'AbortError') {
-          console.log('[PCM] aborted');
+          reportPcmStatus('aborted');
         } else {
-          console.error('[PCM] fetch error:', e);
+          reportPcmStatus('fetch-error', (e && e.name) + ': ' + (e && e.message));
           log('PCM stream error');
         }
       }
