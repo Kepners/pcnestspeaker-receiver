@@ -574,12 +574,12 @@
     }
 
     async function connectHttpPcm(httpUrl) {
-      log('Connecting WebM/Opus stream (low-latency)...');
+      log('Connecting WebM/Opus stream (direct)...');
       currentMode = 'http-pcm';
       reportPcmStatus('handler-entered', 'url=' + httpUrl);
       disconnect();
 
-      // Comprehensive capability probe
+      // Capability probe
       const caps = {
         AudioContext: typeof AudioContext !== 'undefined' || typeof webkitAudioContext !== 'undefined',
         MediaSource: typeof MediaSource !== 'undefined' || typeof WebKitMediaSource !== 'undefined',
@@ -590,127 +590,53 @@
         WebSocket: typeof WebSocket !== 'undefined'
       };
       try {
-        const MS = window.MediaSource || window.WebKitMediaSource;
-        if (MS && MS.isTypeSupported) {
-          caps.opusInWebm = MS.isTypeSupported('audio/webm; codecs="opus"');
-          caps.aacInMp4 = MS.isTypeSupported('audio/mp4; codecs="mp4a.40.2"');
-          caps.heaacInMp4 = MS.isTypeSupported('audio/mp4; codecs="mp4a.40.5"');
-        }
-      } catch (e) { caps.isTypeSupportedErr = e && e.message; }
+        const audioProbe = document.createElement('audio');
+        caps.audio_canPlay_webm_opus = audioProbe.canPlayType('audio/webm; codecs="opus"');
+        caps.audio_canPlay_mp3 = audioProbe.canPlayType('audio/mpeg');
+        caps.audio_canPlay_aac = audioProbe.canPlayType('audio/mp4; codecs="mp4a.40.2"');
+      } catch (e) { caps.canPlayTypeErr = e && e.message; }
       reportPcmStatus('capabilities', JSON.stringify(caps));
 
-      if (!caps.MediaSource) {
-        reportPcmStatus('mse-unavailable');
-        log('MediaSource unavailable');
-        return;
-      }
-      if (caps.opusInWebm === false) {
-        reportPcmStatus('opus-webm-unsupported');
-        log('audio/webm Opus not supported');
-        return;
-      }
-
+      // Direct <audio> element load — no MSE, no fetch+ReadableStream, no
+      // manual buffer management. fetch().body.getReader() proved unreliable
+      // on Cast Audio Chromium (request opens, headers never resolve to JS).
+      // The native audio element opens its own HTTP connection, decodes the
+      // chunked WebM/Opus stream and starts playing as soon as `canplay`
+      // fires. That's the most-tested path on Cast Audio per Google docs.
       const audioEl = webrtcAudio;
       try { hlsAudio.pause(); hlsAudio.removeAttribute('src'); hlsAudio.load(); } catch (e) {}
 
-      pcmMediaSource = new (window.MediaSource || window.WebKitMediaSource)();
-      pcmObjectUrl = URL.createObjectURL(pcmMediaSource);
-      audioEl.src = pcmObjectUrl;
-      pcmAppendQueue = [];
-      pcmStarted = false;
+      audioEl.preload = 'auto';
+      audioEl.crossOrigin = 'anonymous';
 
-      pcmMediaSource.addEventListener('sourceopen', () => {
-        if (pcmMediaSource.readyState !== 'open') return;
-        try {
-          pcmSourceBuffer = pcmMediaSource.addSourceBuffer('audio/webm; codecs="opus"');
-          pcmSourceBuffer.mode = 'sequence';
-        } catch (e) {
-          reportPcmStatus('source-buffer-failed', e && e.message);
-          log('SourceBuffer create failed');
-          return;
-        }
-        reportPcmStatus('source-buffer-ready');
-
-        pcmSourceBuffer.addEventListener('updateend', () => {
-          flushPcmQueue();
-          try {
-            if (!pcmSourceBuffer || pcmSourceBuffer.updating) return;
-            if (pcmSourceBuffer.buffered.length === 0) return;
-            const bufStart = pcmSourceBuffer.buffered.start(0);
-            const bufEnd = pcmSourceBuffer.buffered.end(0);
-
-            // FIRST data parsed → seek to live edge THEN play (this is the fix)
-            if (!pcmStarted && bufEnd - bufStart > 0.04) {
-              pcmStarted = true;
-              const target = Math.max(bufStart, bufEnd - PCM_TARGET_LATENCY);
-              try { audioEl.currentTime = target; } catch (e) {}
-              audioEl.play()
-                .then(() => reportPcmStatus('playing', 'currentTime=' + target.toFixed(3) + ' bufEnd=' + bufEnd.toFixed(3)))
-                .catch(e => reportPcmStatus('play-rejected', e && e.message));
-              return;
-            }
-
-            // Drift management on subsequent chunks
-            const cur = audioEl.currentTime;
-            const drift = bufEnd - cur;
-            if (drift > PCM_MAX_DRIFT) {
-              const target = Math.max(bufStart, bufEnd - PCM_TARGET_LATENCY);
-              audioEl.currentTime = target;
-              reportPcmStatus('drift-resync', 'drift=' + drift.toFixed(2) + ' → ' + target.toFixed(3));
-            } else if (drift > PCM_TARGET_LATENCY * 1.5) {
-              if (audioEl.playbackRate !== PCM_CATCHUP_RATE) audioEl.playbackRate = PCM_CATCHUP_RATE;
-            } else if (drift < PCM_TARGET_LATENCY * 1.1 && audioEl.playbackRate !== PCM_NORMAL_RATE) {
-              audioEl.playbackRate = PCM_NORMAL_RATE;
-            }
-
-            if (cur - bufStart > 2 && !pcmSourceBuffer.updating) {
-              try { pcmSourceBuffer.remove(bufStart, cur - 1); } catch (e) {}
-            }
-          } catch (e) {
-            console.warn('[PCM] updateend handler error:', e && e.message);
+      // Wire up the native media events as status reports back to the PC
+      const events = ['loadstart','loadedmetadata','loadeddata','canplay','canplaythrough','playing','waiting','stalled','suspend','ended','error','emptied'];
+      events.forEach(ev => {
+        audioEl.addEventListener(ev, function listener() {
+          let detail;
+          if (ev === 'error') {
+            const me = audioEl.error;
+            detail = me ? `code=${me.code} msg=${me.message}` : 'unknown';
+          } else {
+            detail = 'currentTime=' + (audioEl.currentTime || 0).toFixed(2) + ' readyState=' + audioEl.readyState;
           }
-        });
-
-        flushPcmQueue();
+          reportPcmStatus('audio-' + ev, detail);
+          if (ev === 'playing') reportPcmStatus('playing', detail);
+        }, { once: false });
       });
 
-      pcmAbort = new AbortController();
-      try {
-        reportPcmStatus('fetch-start', httpUrl);
-        const response = await fetch(httpUrl, {
-          method: 'GET', mode: 'cors', signal: pcmAbort.signal,
-          cache: 'no-store', credentials: 'omit'
-        });
-        reportPcmStatus('fetch-response', 'status=' + response.status + ' ok=' + response.ok + ' ct=' + response.headers.get('content-type'));
-        if (!response.ok) { log('HTTP error ' + response.status); return; }
-        log('Streaming audio (low-latency)...');
+      audioEl.src = httpUrl;
+      reportPcmStatus('audio-src-set', httpUrl);
 
-        const reader = response.body.getReader();
-        let totalBytes = 0;
-        let firstChunkReported = false;
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) {
-            reportPcmStatus('stream-ended', 'totalBytes=' + totalBytes);
-            break;
-          }
-          if (value && value.length > 0) {
-            totalBytes += value.length;
-            if (!firstChunkReported) {
-              reportPcmStatus('first-chunk', 'bytes=' + value.length);
-              firstChunkReported = true;
-            }
-            pcmAppendQueue.push(value);
-            flushPcmQueue();
-          }
-        }
+      try {
+        audioEl.load();  // explicitly start the load
+      } catch (e) { reportPcmStatus('audio-load-failed', e && e.message); }
+
+      try {
+        await audioEl.play();
+        reportPcmStatus('play-resolved', 'paused=' + audioEl.paused + ' ct=' + audioEl.currentTime.toFixed(2));
       } catch (e) {
-        if (e.name === 'AbortError') {
-          reportPcmStatus('aborted');
-        } else {
-          reportPcmStatus('fetch-error', (e && e.name) + ': ' + (e && e.message));
-          log('Stream error');
-        }
+        reportPcmStatus('play-rejected', (e && e.name) + ': ' + (e && e.message));
       }
     }
 
