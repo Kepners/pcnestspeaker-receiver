@@ -535,12 +535,14 @@
     let pcmObjectUrl = null;
     let pcmAppendQueue = [];
     let pcmStarted = false;
+    let pcmDriftTimer = null;
     const PCM_TARGET_LATENCY = 0.30;
     const PCM_MAX_DRIFT = 0.80;
     const PCM_CATCHUP_RATE = 1.10;
     const PCM_NORMAL_RATE = 1.0;
 
     function disconnectHttpPcm() {
+      if (pcmDriftTimer) { try { clearInterval(pcmDriftTimer); } catch (e) {} pcmDriftTimer = null; }
       if (pcmAbort) { try { pcmAbort.abort(); } catch (e) {} pcmAbort = null; }
       if (pcmSourceBuffer && pcmMediaSource && pcmMediaSource.readyState === 'open') {
         try { pcmMediaSource.endOfStream(); } catch (e) {}
@@ -550,7 +552,7 @@
       pcmMediaSource = null;
       pcmAppendQueue = [];
       pcmStarted = false;
-      try { webrtcAudio.pause(); webrtcAudio.removeAttribute('src'); webrtcAudio.load(); } catch (e) {}
+      try { webrtcAudio.pause(); webrtcAudio.removeAttribute('src'); webrtcAudio.load(); webrtcAudio.playbackRate = 1.0; } catch (e) {}
     }
 
     function flushPcmQueue() {
@@ -638,6 +640,55 @@
       } catch (e) {
         reportPcmStatus('play-rejected', (e && e.name) + ': ' + (e && e.message));
       }
+
+      // ─── Active live-edge drift management ────────────────────────────
+      // The native <audio> element on Cast Audio doesn't snap to live edge
+      // once playing — over time its internal buffer grows and pause/play
+      // latency creeps from ~1 s up to 5+ s. Every 500 ms we check the gap
+      // between buffered.end and currentTime; if it's drifted we either
+      // bump playbackRate to catch up gradually, or hard-seek if it's
+      // gone too far.
+      const TARGET_LAG = 0.30;  // seconds behind live edge we aim to maintain
+      const SOFT_LAG = 0.80;    // bump playbackRate above this
+      const HARD_LAG = 1.50;    // hard-seek above this
+      const CATCHUP_RATE = 1.05;
+      const NORMAL_RATE = 1.0;
+      let lastDriftReport = 0;
+
+      if (pcmDriftTimer) { try { clearInterval(pcmDriftTimer); } catch (e) {} }
+      pcmDriftTimer = setInterval(() => {
+        if (currentMode !== 'http-pcm') {
+          clearInterval(pcmDriftTimer);
+          pcmDriftTimer = null;
+          return;
+        }
+        if (audioEl.paused || audioEl.readyState < 2) return;
+        if (audioEl.buffered.length === 0) return;
+        const liveEdge = audioEl.buffered.end(audioEl.buffered.length - 1);
+        const cur = audioEl.currentTime;
+        const lag = liveEdge - cur;
+        const now = Date.now();
+
+        if (lag > HARD_LAG) {
+          const target = Math.max(cur, liveEdge - TARGET_LAG);
+          try { audioEl.currentTime = target; } catch (e) {}
+          if (now - lastDriftReport > 1000) {
+            reportPcmStatus('drift-resync', 'lag=' + lag.toFixed(2) + 's → seek ' + target.toFixed(2));
+            lastDriftReport = now;
+          }
+          if (audioEl.playbackRate !== NORMAL_RATE) audioEl.playbackRate = NORMAL_RATE;
+        } else if (lag > SOFT_LAG) {
+          if (audioEl.playbackRate !== CATCHUP_RATE) {
+            audioEl.playbackRate = CATCHUP_RATE;
+            if (now - lastDriftReport > 1500) {
+              reportPcmStatus('drift-catchup', 'lag=' + lag.toFixed(2) + 's → 1.05x');
+              lastDriftReport = now;
+            }
+          }
+        } else if (lag < TARGET_LAG * 1.3 && audioEl.playbackRate !== NORMAL_RATE) {
+          audioEl.playbackRate = NORMAL_RATE;
+        }
+      }, 500);
     }
 
     // Wrap disconnect again to also tear down http-pcm
