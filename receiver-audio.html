@@ -648,9 +648,11 @@
       // between buffered.end and currentTime; if it's drifted we either
       // bump playbackRate to catch up gradually, or hard-seek if it's
       // gone too far.
-      const TARGET_LAG = 0.30;  // seconds behind live edge we aim to maintain
-      const SOFT_LAG = 0.80;    // bump playbackRate above this
-      const HARD_LAG = 1.50;    // hard-seek above this
+      // 1.5.3 "responsive mode" — tighter envelope. Trade-off: more sensitive to
+      // Wi-Fi jitter, more frequent micro-corrections. Net win on clean LAN.
+      const TARGET_LAG = 0.18;  // was 0.30 — direct subtract from steady-state latency
+      const SOFT_LAG = 0.50;    // was 0.80 — earlier playbackRate bump
+      const HARD_LAG = 0.90;    // was 1.50 — earlier hard-seek to live edge
       const CATCHUP_RATE = 1.05;
       const NORMAL_RATE = 1.0;
       let lastDriftReport = 0;
