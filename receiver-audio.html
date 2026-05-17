@@ -560,7 +560,15 @@
       pcmMediaSource = null;
       pcmAppendQueue = [];
       pcmStarted = false;
-      try { webrtcAudio.pause(); webrtcAudio.removeAttribute('src'); webrtcAudio.load(); webrtcAudio.playbackRate = 1.0; } catch (e) {}
+      try {
+        webrtcAudio.pause();
+        webrtcAudio.removeAttribute('src');
+        webrtcAudio.load();
+        webrtcAudio.playbackRate = 1.0;
+        if ('preservesPitch' in webrtcAudio) webrtcAudio.preservesPitch = true;
+        if ('mozPreservesPitch' in webrtcAudio) webrtcAudio.mozPreservesPitch = true;
+        if ('webkitPreservesPitch' in webrtcAudio) webrtcAudio.webkitPreservesPitch = true;
+      } catch (e) {}
     }
 
     function flushPcmQueue() {
@@ -606,6 +614,10 @@
 
       audioEl.preload = 'auto';
       audioEl.crossOrigin = 'anonymous';
+      audioEl.playbackRate = 1.0;
+      if ('preservesPitch' in audioEl) audioEl.preservesPitch = true;
+      if ('mozPreservesPitch' in audioEl) audioEl.mozPreservesPitch = true;
+      if ('webkitPreservesPitch' in audioEl) audioEl.webkitPreservesPitch = true;
 
       // Wire native media events into the same status stream we use for the
       // <audio> path so the desktop log can compare apples to apples.
@@ -904,6 +916,10 @@
 
       audioEl.preload = 'auto';
       audioEl.crossOrigin = 'anonymous';
+      audioEl.playbackRate = 1.0;
+      if ('preservesPitch' in audioEl) audioEl.preservesPitch = true;
+      if ('mozPreservesPitch' in audioEl) audioEl.mozPreservesPitch = true;
+      if ('webkitPreservesPitch' in audioEl) audioEl.webkitPreservesPitch = true;
 
       // Wire up the native media events as status reports back to the PC
       const events = ['loadstart','loadedmetadata','loadeddata','canplay','canplaythrough','playing','waiting','stalled','suspend','ended','error','emptied'];
@@ -936,18 +952,13 @@
       }
 
       // ─── Active live-edge drift management ────────────────────────────
-      // The native <audio> element on Cast Audio doesn't snap to live edge
-      // once playing — over time its internal buffer grows and pause/play
-      // latency creeps from ~1 s up to 5+ s. Every 500 ms we check the gap
-      // between buffered.end and currentTime; if it's drifted we either
-      // bump playbackRate to catch up gradually, or hard-seek if it's
-      // gone too far.
-      // 1.5.3 "responsive mode" — tighter envelope. Trade-off: more sensitive to
-      // Wi-Fi jitter, more frequent micro-corrections. Net win on clean LAN.
-      const TARGET_LAG = 0.18;
-      const SOFT_LAG = 0.50;
-      const HARD_LAG = 0.90;
-      const CATCHUP_RATE = 1.05;
+      // The native <audio> element on Cast Audio may not snap to live edge
+      // once playing. Keep this quality-first: probe whether seek actually
+      // works, then use hard seek only when proven. Do not use playbackRate
+      // catch-up on the plain <audio> path; it can create audible artifacts.
+      const TARGET_LAG = 0.30;
+      const PROBE_LAG = 0.80;
+      const HARD_LAG = 1.50;
       const NORMAL_RATE = 1.0;
       let lastDriftReport = 0;
       let seekProbeSent = false;
@@ -968,10 +979,10 @@
         const now = Date.now();
 
         // 1.5.4: one-shot probe — does this audio element actually let us seek?
-        // Per MDN, Chromium treats live HTTP streams as non-seekable. If true,
-        // our currentTime= and playbackRate= calls below are no-ops and the
-        // 1.5 s floor the user observed is the audio element's internal buffer.
-        if (!seekProbeSent && lag > 0.5) {
+        // Per MDN, Chromium can treat live HTTP streams as non-seekable. If
+        // true, currentTime/fastSeek is ignored and latency is the audio
+        // element's internal buffer until a real MSE/RTP path replaces it.
+        if (!seekProbeSent && lag > PROBE_LAG) {
           seekProbeSent = true;
           const seekableInfo = {
             seekable_length: audioEl.seekable.length,
@@ -999,10 +1010,13 @@
             seekActuallyWorks = Math.abs(audioEl.currentTime - probeTarget) < 0.1;
             seekableInfo.seek_works = seekActuallyWorks;
             reportPcmStatus('seek-probe', JSON.stringify(seekableInfo));
+            if (!seekActuallyWorks) {
+              reportPcmStatus('drift-unbounded', 'plain-audio-live-stream-not-seekable; playbackRate disabled for quality');
+            }
           }, 100);
         }
 
-        if (lag > HARD_LAG) {
+        if (lag > HARD_LAG && seekActuallyWorks === true) {
           const target = Math.max(cur, liveEdge - TARGET_LAG);
           try {
             if (typeof audioEl.fastSeek === 'function') audioEl.fastSeek(target);
@@ -1013,16 +1027,12 @@
             lastDriftReport = now;
           }
           if (audioEl.playbackRate !== NORMAL_RATE) audioEl.playbackRate = NORMAL_RATE;
-        } else if (lag > SOFT_LAG) {
-          if (audioEl.playbackRate !== CATCHUP_RATE) {
-            audioEl.playbackRate = CATCHUP_RATE;
-            if (now - lastDriftReport > 1500) {
-              reportPcmStatus('drift-catchup', 'lag=' + lag.toFixed(2) + 's → 1.05x');
-              lastDriftReport = now;
-            }
+        } else {
+          if (audioEl.playbackRate !== NORMAL_RATE) audioEl.playbackRate = NORMAL_RATE;
+          if (lag > HARD_LAG && seekActuallyWorks === false && now - lastDriftReport > 5000) {
+            reportPcmStatus('drift-unbounded', 'lag=' + lag.toFixed(2) + 's; seek unsupported; playbackRate disabled');
+            lastDriftReport = now;
           }
-        } else if (lag < TARGET_LAG * 1.3 && audioEl.playbackRate !== NORMAL_RATE) {
-          audioEl.playbackRate = NORMAL_RATE;
         }
       }, 500);
     }
