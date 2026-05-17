@@ -997,20 +997,12 @@
         }
       }, 1000);
 
-      // ─── Active live-edge drift management ────────────────────────────
-      // The native <audio> element on Cast Audio may not snap to live edge
-      // once playing. Keep this quality-first: probe whether seek actually
-      // works, then use hard seek only when proven. Do not use playbackRate
-      // catch-up on the plain <audio> path; it can create audible artifacts.
-      const TARGET_LAG = 0.30;
-      const PROBE_LAG = 0.80;
-      const HARD_LAG = 1.50;
-      const NORMAL_RATE = 1.0;
-      let lastDriftReport = 0;
-      let seekProbeSent = false;
-      let seekActuallyWorks = null;  // true/false once probed; null until first attempt
+      // Plain <audio> live-state monitor.
+      // Test mode: never seek or alter currentTime on the native live <audio>
+      // path. The Cast Audio logs show this timeline can expose Infinity and
+      // stall, so this separates native player behavior from our drift code.
       let lastNoBufferReport = 0;
-      let lastInfiniteLiveEdgeReport = 0;
+      let lastPlainAudioRangeReport = 0;
 
       if (pcmDriftTimer) { try { clearInterval(pcmDriftTimer); } catch (e) {} }
       pcmDriftTimer = setInterval(() => {
@@ -1028,74 +1020,10 @@
           }
           return;
         }
-        const liveEdge = audioEl.buffered.end(audioEl.buffered.length - 1);
-        const cur = audioEl.currentTime;
-        if (!Number.isFinite(liveEdge)) {
-          const now = Date.now();
-          if (now - lastInfiniteLiveEdgeReport > 2000) {
-            reportPcmStatus('drift-live-edge-infinite', describeAudioElement(audioEl));
-            lastInfiniteLiveEdgeReport = now;
-          }
-          return;
-        }
-        const lag = liveEdge - cur;
-        const now = Date.now();
-
-        // 1.5.4: one-shot probe — does this audio element actually let us seek?
-        // Per MDN, Chromium can treat live HTTP streams as non-seekable. If
-        // true, currentTime/fastSeek is ignored and latency is the audio
-        // element's internal buffer until a real MSE/RTP path replaces it.
-        if (!seekProbeSent && lag > PROBE_LAG) {
-          seekProbeSent = true;
-          const seekableInfo = {
-            seekable_length: audioEl.seekable.length,
-            seekable_start: audioEl.seekable.length > 0 ? audioEl.seekable.start(0) : null,
-            seekable_end: audioEl.seekable.length > 0 ? audioEl.seekable.end(audioEl.seekable.length - 1) : null,
-            buffered_end: liveEdge,
-            currentTime_before: cur
-          };
-          const probeTarget = liveEdge - TARGET_LAG;
-          try {
-            if (typeof audioEl.fastSeek === 'function') {
-              audioEl.fastSeek(probeTarget);
-              seekableInfo.seek_method = 'fastSeek';
-            } else {
-              audioEl.currentTime = probeTarget;
-              seekableInfo.seek_method = 'currentTime';
-            }
-          } catch (e) {
-            seekableInfo.seek_error = e && e.message;
-          }
-          // Re-read currentTime AFTER attempted seek to see if it actually moved
-          setTimeout(() => {
-            seekableInfo.currentTime_after = audioEl.currentTime;
-            seekableInfo.seek_target = probeTarget;
-            seekActuallyWorks = Math.abs(audioEl.currentTime - probeTarget) < 0.1;
-            seekableInfo.seek_works = seekActuallyWorks;
-            reportPcmStatus('seek-probe', JSON.stringify(seekableInfo));
-            if (!seekActuallyWorks) {
-              reportPcmStatus('drift-unbounded', 'plain-audio-live-stream-not-seekable; playbackRate disabled for quality');
-            }
-          }, 100);
-        }
-
-        if (lag > HARD_LAG && seekActuallyWorks === true) {
-          const target = Math.max(cur, liveEdge - TARGET_LAG);
-          try {
-            if (typeof audioEl.fastSeek === 'function') audioEl.fastSeek(target);
-            else audioEl.currentTime = target;
-          } catch (e) {}
-          if (now - lastDriftReport > 1000) {
-            reportPcmStatus('drift-resync', 'lag=' + lag.toFixed(2) + 's → seek ' + target.toFixed(2));
-            lastDriftReport = now;
-          }
-          if (audioEl.playbackRate !== NORMAL_RATE) audioEl.playbackRate = NORMAL_RATE;
-        } else {
-          if (audioEl.playbackRate !== NORMAL_RATE) audioEl.playbackRate = NORMAL_RATE;
-          if (lag > HARD_LAG && seekActuallyWorks === false && now - lastDriftReport > 5000) {
-            reportPcmStatus('drift-unbounded', 'lag=' + lag.toFixed(2) + 's; seek unsupported; playbackRate disabled');
-            lastDriftReport = now;
-          }
+        const plainAudioNow = Date.now();
+        if (plainAudioNow - lastPlainAudioRangeReport > 2000) {
+          reportPcmStatus('plain-audio-drift-disabled', describeAudioElement(audioEl));
+          lastPlainAudioRangeReport = plainAudioNow;
         }
       }, 500);
     }
