@@ -962,6 +962,18 @@
       }
     }
 
+    function reportCustomStatus(status, detail) {
+      try {
+        context.sendCustomMessage(WEBRTC_NAMESPACE, undefined, {
+          type: 'pcm-status',
+          status,
+          detail: detail || ''
+        });
+      } catch (e) {
+        console.warn('[Cast] status report failed:', e);
+      }
+    }
+
     function handleMessage(event) {
       console.log('[Cast] Message:', event.data);
       const data = event.data;
@@ -981,6 +993,7 @@
           break;
         case 'http-pcm':
           if (data.url) {
+            reportCustomStatus('visual-trampoline', data.url);
             const target = new URL('receiver-audio.html', window.location.href);
             target.searchParams.set('httpPcm', data.url);
             target.searchParams.set('from', 'visual-trampoline');
