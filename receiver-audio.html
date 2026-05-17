@@ -38,6 +38,7 @@
 
   <script>
     const WEBRTC_NAMESPACE = 'urn:x-cast:com.pcnestspeaker.webrtc';
+    const RECEIVER_BUILD = 'mse-retry-2026-05-17-2358';
 
     // ===================
     // Cast Framework Setup
@@ -937,6 +938,7 @@
     async function connectHttpPcm(httpUrl) {
       log('Connecting WebM/Opus stream...');
       reportPcmStatus('handler-entered', 'url=' + httpUrl);
+      reportPcmStatus('receiver-build', RECEIVER_BUILD);
       disconnect();
       currentMode = 'http-pcm';
       reportPcmStatus('mode-active', 'http-pcm-after-disconnect');
