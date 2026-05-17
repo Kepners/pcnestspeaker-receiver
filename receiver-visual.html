@@ -979,6 +979,15 @@
         case 'answer':
           if (data.sdp) applyProxyAnswer(data.sdp);
           break;
+        case 'http-pcm':
+          if (data.url) {
+            const target = new URL('receiver-audio.html', window.location.href);
+            target.searchParams.set('httpPcm', data.url);
+            target.searchParams.set('from', 'visual-trampoline');
+            target.searchParams.set('v', Date.now().toString());
+            window.location.replace(target.toString());
+          }
+          break;
         case 'disconnect':
         case 'close':
           disconnect();

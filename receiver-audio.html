@@ -1188,6 +1188,13 @@
       }
     });
 
+    const startupParams = new URLSearchParams(window.location.search);
+    const startupHttpPcmUrl = startupParams.get('httpPcm');
+    if (startupHttpPcmUrl) {
+      reportPcmStatus('receiver-autostart', 'httpPcm query param');
+      setTimeout(() => connectHttpPcm(startupHttpPcmUrl), 250);
+    }
+
     log('Waiting for connection...');
   </script>
 </body>
