@@ -544,6 +544,7 @@
     let pcmAppendQueue = [];
     let pcmStarted = false;
     let pcmDriftTimer = null;
+    let pcmHealthTimer = null;
     const PCM_TARGET_LATENCY = 0.30;
     const PCM_MAX_DRIFT = 0.80;
     const PCM_CATCHUP_RATE = 1.10;
@@ -551,6 +552,7 @@
 
     function disconnectHttpPcm() {
       if (pcmDriftTimer) { try { clearInterval(pcmDriftTimer); } catch (e) {} pcmDriftTimer = null; }
+      if (pcmHealthTimer) { try { clearInterval(pcmHealthTimer); } catch (e) {} pcmHealthTimer = null; }
       if (pcmAbort) { try { pcmAbort.abort(); } catch (e) {} pcmAbort = null; }
       if (pcmSourceBuffer && pcmMediaSource && pcmMediaSource.readyState === 'open') {
         try { pcmMediaSource.endOfStream(); } catch (e) {}
@@ -589,6 +591,33 @@
       } catch (e) {
         console.warn('[PCM] sendCustomMessage failed:', e && e.message);
       }
+    }
+
+    function describeAudioElement(audioEl) {
+      let detail = 'ct=' + (audioEl.currentTime || 0).toFixed(2) +
+        ' ready=' + audioEl.readyState +
+        ' net=' + audioEl.networkState +
+        ' paused=' + audioEl.paused +
+        ' ended=' + audioEl.ended +
+        ' bufLen=' + audioEl.buffered.length +
+        ' seekLen=' + audioEl.seekable.length;
+      try {
+        if (audioEl.buffered.length > 0) {
+          detail += ' bufStart=' + audioEl.buffered.start(0).toFixed(2) +
+            ' bufEnd=' + audioEl.buffered.end(audioEl.buffered.length - 1).toFixed(2);
+        }
+      } catch (e) {
+        detail += ' bufErr=' + (e && e.message);
+      }
+      try {
+        if (audioEl.seekable.length > 0) {
+          detail += ' seekStart=' + audioEl.seekable.start(0).toFixed(2) +
+            ' seekEnd=' + audioEl.seekable.end(audioEl.seekable.length - 1).toFixed(2);
+        }
+      } catch (e) {
+        detail += ' seekErr=' + (e && e.message);
+      }
+      return detail;
     }
 
     // 1.5.6: MSE+SourceBuffer path — control the buffer ourselves so we can
@@ -931,7 +960,7 @@
             const me = audioEl.error;
             detail = me ? `code=${me.code} msg=${me.message}` : 'unknown';
           } else {
-            detail = 'currentTime=' + (audioEl.currentTime || 0).toFixed(2) + ' readyState=' + audioEl.readyState;
+            detail = describeAudioElement(audioEl);
           }
           reportPcmStatus('audio-' + ev, detail);
           if (ev === 'playing') reportPcmStatus('playing', detail);
@@ -947,10 +976,26 @@
 
       try {
         await audioEl.play();
-        reportPcmStatus('play-resolved', 'paused=' + audioEl.paused + ' ct=' + audioEl.currentTime.toFixed(2));
+        reportPcmStatus('play-resolved', describeAudioElement(audioEl));
       } catch (e) {
         reportPcmStatus('play-rejected', (e && e.name) + ': ' + (e && e.message));
       }
+
+      let healthTicks = 0;
+      if (pcmHealthTimer) { try { clearInterval(pcmHealthTimer); } catch (e) {} }
+      pcmHealthTimer = setInterval(() => {
+        if (currentMode !== 'http-pcm') {
+          clearInterval(pcmHealthTimer);
+          pcmHealthTimer = null;
+          return;
+        }
+        healthTicks += 1;
+        reportPcmStatus('audio-health', describeAudioElement(audioEl));
+        if (healthTicks >= 12) {
+          clearInterval(pcmHealthTimer);
+          pcmHealthTimer = null;
+        }
+      }, 1000);
 
       // ─── Active live-edge drift management ────────────────────────────
       // The native <audio> element on Cast Audio may not snap to live edge
@@ -964,6 +1009,7 @@
       let lastDriftReport = 0;
       let seekProbeSent = false;
       let seekActuallyWorks = null;  // true/false once probed; null until first attempt
+      let lastNoBufferReport = 0;
 
       if (pcmDriftTimer) { try { clearInterval(pcmDriftTimer); } catch (e) {} }
       pcmDriftTimer = setInterval(() => {
@@ -973,7 +1019,14 @@
           return;
         }
         if (audioEl.paused || audioEl.readyState < 2) return;
-        if (audioEl.buffered.length === 0) return;
+        if (audioEl.buffered.length === 0) {
+          const now = Date.now();
+          if (now - lastNoBufferReport > 2000) {
+            reportPcmStatus('drift-no-buffered-range', describeAudioElement(audioEl));
+            lastNoBufferReport = now;
+          }
+          return;
+        }
         const liveEdge = audioEl.buffered.end(audioEl.buffered.length - 1);
         const cur = audioEl.currentTime;
         const lag = liveEdge - cur;
