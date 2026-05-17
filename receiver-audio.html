@@ -1010,6 +1010,7 @@
       let seekProbeSent = false;
       let seekActuallyWorks = null;  // true/false once probed; null until first attempt
       let lastNoBufferReport = 0;
+      let lastInfiniteLiveEdgeReport = 0;
 
       if (pcmDriftTimer) { try { clearInterval(pcmDriftTimer); } catch (e) {} }
       pcmDriftTimer = setInterval(() => {
@@ -1029,6 +1030,14 @@
         }
         const liveEdge = audioEl.buffered.end(audioEl.buffered.length - 1);
         const cur = audioEl.currentTime;
+        if (!Number.isFinite(liveEdge)) {
+          const now = Date.now();
+          if (now - lastInfiniteLiveEdgeReport > 2000) {
+            reportPcmStatus('drift-live-edge-infinite', describeAudioElement(audioEl));
+            lastInfiniteLiveEdgeReport = now;
+          }
+          return;
+        }
         const lag = liveEdge - cur;
         const now = Date.now();
 
