@@ -632,7 +632,9 @@
     async function connectHttpPcmMse(httpUrl) {
       reportPcmStatus('mse-attempt', httpUrl);
       const FIRST_BYTE_TIMEOUT_MS = 3500;
+      const FIRST_APPEND_TIMEOUT_MS = 3500;
       const SOURCE_OPEN_TIMEOUT_MS = 4000;
+      const PLAY_TIMEOUT_MS = 3000;
       const TARGET_LATENCY = 0.20;   // seek to within 200 ms of live edge
       const SOFT_LAG = 0.40;
       const HARD_LAG = 0.80;
@@ -698,11 +700,27 @@
       pcmAppendQueue = [];
       reportPcmStatus('mse-sb-added', 'mode=' + sb.mode);
 
+      let firstAppendDone = false;
+      let firstAppendResolve, firstAppendReject;
+      const firstAppendSignal = new Promise((res, rej) => { firstAppendResolve = res; firstAppendReject = rej; });
+      const firstAppendTimer = setTimeout(() => {
+        if (!firstAppendDone) firstAppendReject(new Error('first-append watchdog ' + FIRST_APPEND_TIMEOUT_MS + 'ms'));
+      }, FIRST_APPEND_TIMEOUT_MS);
+
       sb.addEventListener('updateend', () => {
+        if (!firstAppendDone && sb.buffered.length > 0) {
+          firstAppendDone = true;
+          clearTimeout(firstAppendTimer);
+          reportPcmStatus('mse-first-append', 'bufEnd=' + sb.buffered.end(sb.buffered.length - 1).toFixed(2));
+          firstAppendResolve();
+        }
         // Drain queue
         if (pcmAppendQueue.length > 0 && !sb.updating) {
           try { sb.appendBuffer(pcmAppendQueue.shift()); }
-          catch (e) { reportPcmStatus('mse-append-err', e && e.message); }
+          catch (e) {
+            reportPcmStatus('mse-append-err', e && e.message);
+            if (!firstAppendDone) firstAppendReject(e);
+          }
         }
       });
 
@@ -785,6 +803,7 @@
                   } catch (_) {}
                 } else {
                   reportPcmStatus('mse-append-err', e && e.message);
+                  if (!firstAppendDone) firstAppendReject(e);
                 }
               }
             }
@@ -796,15 +815,33 @@
 
       // Block here until first byte arrives (or watchdog throws)
       await firstByteSignal;
+      await firstAppendSignal;
+
+      if (sb.buffered.length > 0) {
+        const liveEdge = sb.buffered.end(sb.buffered.length - 1);
+        const target = Math.max(sb.buffered.start(0), liveEdge - TARGET_LATENCY);
+        if (Number.isFinite(target)) {
+          try {
+            audioEl.currentTime = target;
+            reportPcmStatus('mse-start-seek', 'target=' + target.toFixed(2) + ' liveEdge=' + liveEdge.toFixed(2));
+          } catch (e) {
+            reportPcmStatus('mse-start-seek-failed', e && e.message);
+          }
+        }
+      }
 
       // Now start playback. Native <audio> may auto-play once it sees data via
       // the MediaSource — call play() explicitly anyway for the platforms
       // that need it.
       try {
-        await audioEl.play();
+        await Promise.race([
+          audioEl.play(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('play watchdog ' + PLAY_TIMEOUT_MS + 'ms')), PLAY_TIMEOUT_MS))
+        ]);
         reportPcmStatus('mse-play-resolved', 'ct=' + audioEl.currentTime.toFixed(2));
       } catch (e) {
         reportPcmStatus('mse-play-rejected', (e && e.name) + ': ' + (e && e.message));
+        throw e;
       }
 
       // Drift loop — trim old data, seek to live edge if we fall behind.
@@ -926,17 +963,21 @@
       } catch (e) { caps.canPlayTypeErr = e && e.message; }
       reportPcmStatus('capabilities', JSON.stringify(caps));
 
-      // 1.5.8 EMERGENCY: MSE attempt disabled.
-      // 1.5.6/1.5.7 testing showed `await fetch()` hangs forever on this
-      // runtime even with watchdogs (the watchdog itself either doesn't
-      // run or the cached old receiver is being served). Symptoms in user
-      // logs: receiver stops at `mse-fetch-start` and never reports
-      // `mse-fallback-to-audio`. Audio is dead.
-      // Going straight to the plain <audio src=> path (which has worked
-      // since 1.5.0) until the research path ships a working alternative
-      // (likely XHR-based feeding into MSE, per Cast Audio compatibility
-      // patterns; or the owntone-style 85CDB22F + Cast RTP rewrite).
-      reportPcmStatus('mse-skip', 'mse-disabled-1.5.8');
+      const mseAvailable = caps.MediaSource && caps.fetch && caps.ReadableStream && caps.AbortController &&
+        caps.mse_isTypeSupported_webm_opus === true;
+      if (mseAvailable) {
+        try {
+          await connectHttpPcmMse(httpUrl);
+          return;
+        } catch (e) {
+          reportPcmStatus('mse-fallback-to-audio', e && e.message ? e.message : e);
+          disconnectHttpPcm();
+          currentMode = 'http-pcm';
+          reportPcmStatus('mode-active', 'http-pcm-after-mse-fallback');
+        }
+      } else {
+        reportPcmStatus('mse-skip', 'mse-unavailable-or-unsupported');
+      }
 
       // Plain <audio src> fallback. The native audio element opens its own
       // HTTP connection, decodes the chunked WebM/Opus stream and starts
