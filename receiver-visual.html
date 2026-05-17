@@ -578,6 +578,49 @@
       audioElement.srcObject = null;
     }
 
+    function describeAudioElement() {
+      try {
+        return `ct=${Number.isFinite(audioElement.currentTime) ? audioElement.currentTime.toFixed(2) : String(audioElement.currentTime)} ready=${audioElement.readyState} net=${audioElement.networkState} paused=${audioElement.paused} ended=${audioElement.ended}`;
+      } catch (e) {
+        return 'audio-state-unavailable';
+      }
+    }
+
+    function playHttpWebmAudio(url) {
+      reportCustomStatus('visual-http-handler', url);
+      stopHlsAudio();
+      audioElement.pause();
+      audioElement.removeAttribute('src');
+      audioElement.srcObject = null;
+      audioElement.preload = 'auto';
+      audioElement.autoplay = true;
+      audioElement.muted = false;
+      audioElement.volume = 1.0;
+
+      const eventNames = ['loadstart', 'loadedmetadata', 'loadeddata', 'canplay', 'playing', 'waiting', 'stalled', 'error', 'ended'];
+      for (const eventName of eventNames) {
+        audioElement.addEventListener(eventName, () => {
+          const status = eventName === 'error' ? 'visual-http-audio-error' : `visual-http-audio-${eventName}`;
+          const detail = eventName === 'error'
+            ? `${audioElement.error ? audioElement.error.code : 'unknown'} ${describeAudioElement()}`
+            : describeAudioElement();
+          reportCustomStatus(status, detail);
+        }, { once: true });
+      }
+
+      audioElement.src = url;
+      audioElement.load();
+      audioElement.play()
+        .then(() => {
+          reportCustomStatus('visual-http-play-resolved', describeAudioElement());
+          log('HTTP audio streaming...');
+          transitionToStreaming();
+        })
+        .catch((e) => {
+          reportCustomStatus('visual-http-play-rejected', `${e.name || 'Error'}: ${e.message || String(e)}`);
+        });
+    }
+
     // ===================
     // GEORGE LUCAS WIPE TRANSITION
     // Shows splash for 5 seconds, then wipes to ambient videos
@@ -994,11 +1037,7 @@
         case 'http-pcm':
           if (data.url) {
             reportCustomStatus('visual-trampoline', data.url);
-            const target = new URL('receiver-audio.html', window.location.href);
-            target.searchParams.set('httpPcm', data.url);
-            target.searchParams.set('from', 'visual-trampoline');
-            target.searchParams.set('v', Date.now().toString());
-            window.location.replace(target.toString());
+            playHttpWebmAudio(data.url);
           }
           break;
         case 'disconnect':
