@@ -870,9 +870,10 @@
 
     async function connectHttpPcm(httpUrl) {
       log('Connecting WebM/Opus stream...');
-      currentMode = 'http-pcm';
       reportPcmStatus('handler-entered', 'url=' + httpUrl);
       disconnect();
+      currentMode = 'http-pcm';
+      reportPcmStatus('mode-active', 'http-pcm-after-disconnect');
 
       // Capability probe
       const caps = {
