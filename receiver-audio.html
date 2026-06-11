@@ -38,7 +38,7 @@
 
   <script>
     const WEBRTC_NAMESPACE = 'urn:x-cast:com.pcnestspeaker.webrtc';
-    const RECEIVER_BUILD = 'mse-retry-2026-05-17-2358';
+    const RECEIVER_BUILD = 'plain-audio-restore-2026-06-11';
 
     // ===================
     // Cast Framework Setup
@@ -965,7 +965,14 @@
       } catch (e) { caps.canPlayTypeErr = e && e.message; }
       reportPcmStatus('capabilities', JSON.stringify(caps));
 
-      const mseAvailable = caps.MediaSource && caps.fetch && caps.ReadableStream && caps.AbortController &&
+      // MSE dies SILENTLY on the Cast Audio runtime (Nest Mini): the failure is an
+      // async DOM MediaError, not a throwable, so the catch below never fires and
+      // the receiver goes silent with no audio. Proven on hardware (mse-fetch-start
+      // -> socket break, zero mse-active ever). The plain <audio> path below is the
+      // proven-fast known-good path (1.5.8 / 9b7a2e1) and beats Google's DMR buffer.
+      // Flip this flag only if a future build proves MSE actually plays on the device.
+      const ENABLE_MSE_EXPERIMENT = false;
+      const mseAvailable = ENABLE_MSE_EXPERIMENT && caps.MediaSource && caps.fetch && caps.ReadableStream && caps.AbortController &&
         caps.mse_isTypeSupported_webm_opus === true;
       if (mseAvailable) {
         try {
