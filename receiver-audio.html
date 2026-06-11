@@ -38,7 +38,7 @@
 
   <script>
     const WEBRTC_NAMESPACE = 'urn:x-cast:com.pcnestspeaker.webrtc';
-    const RECEIVER_BUILD = 'plain-audio-restore-2026-06-11';
+    const RECEIVER_BUILD = 'active-sync-2026-06-11';
 
     // ===================
     // Cast Framework Setup
@@ -1133,6 +1133,21 @@
         case 'measure-latency':
           // PC requested latency measurement
           startRTTMeasurement();
+          break;
+        case 'set-rate':
+          // Active sync: the PC nudges this speaker's playback speed to slide it
+          // back into alignment with the other speaker — gapless, no reload.
+          // preservesPitch keeps the small tempo change from altering pitch.
+          if (typeof data.rate === 'number' && webrtcAudio) {
+            const r = Math.max(0.90, Math.min(1.10, data.rate));
+            try {
+              if ('preservesPitch' in webrtcAudio) webrtcAudio.preservesPitch = true;
+              webrtcAudio.playbackRate = r;
+              reportPcmStatus('rate-set', 'rate=' + r.toFixed(3) + ' ct=' + ((webrtcAudio.currentTime || 0).toFixed(2)));
+            } catch (e) {
+              reportPcmStatus('rate-error', e && e.message);
+            }
+          }
           break;
       }
     }
