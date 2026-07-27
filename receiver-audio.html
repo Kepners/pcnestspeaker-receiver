@@ -38,7 +38,7 @@
 
   <script>
     const WEBRTC_NAMESPACE = 'urn:x-cast:com.pcnestspeaker.webrtc';
-    const RECEIVER_BUILD = 'active-sync-2026-06-11';
+    const RECEIVER_BUILD = 'native-live-guard-2026-07-27';
 
     // ===================
     // Cast Framework Setup
@@ -546,6 +546,13 @@
     let pcmStarted = false;
     let pcmDriftTimer = null;
     let pcmHealthTimer = null;
+    let pcmNativeUrl = null;
+    let pcmNativeEventHandlers = [];
+    let pcmNativeRecoveryTimer = null;
+    let pcmNativeStartedAt = 0;
+    let pcmNativeLastRecoveryAt = 0;
+    const PCM_NATIVE_RECOVERY_GRACE_MS = 3000;
+    const PCM_NATIVE_RECOVERY_COOLDOWN_MS = 5000;
     const PCM_TARGET_LATENCY = 0.30;
     const PCM_MAX_DRIFT = 0.80;
     const PCM_CATCHUP_RATE = 1.10;
@@ -554,6 +561,8 @@
     function disconnectHttpPcm() {
       if (pcmDriftTimer) { try { clearInterval(pcmDriftTimer); } catch (e) {} pcmDriftTimer = null; }
       if (pcmHealthTimer) { try { clearInterval(pcmHealthTimer); } catch (e) {} pcmHealthTimer = null; }
+      if (pcmNativeRecoveryTimer) { try { clearTimeout(pcmNativeRecoveryTimer); } catch (e) {} pcmNativeRecoveryTimer = null; }
+      removeNativeAudioEventListeners();
       if (pcmAbort) { try { pcmAbort.abort(); } catch (e) {} pcmAbort = null; }
       if (pcmSourceBuffer && pcmMediaSource && pcmMediaSource.readyState === 'open') {
         try { pcmMediaSource.endOfStream(); } catch (e) {}
@@ -563,6 +572,9 @@
       pcmMediaSource = null;
       pcmAppendQueue = [];
       pcmStarted = false;
+      pcmNativeUrl = null;
+      pcmNativeStartedAt = 0;
+      pcmNativeLastRecoveryAt = 0;
       try {
         webrtcAudio.pause();
         webrtcAudio.removeAttribute('src');
@@ -591,6 +603,75 @@
         console.log('[PCM][status]', status, detail || '');
       } catch (e) {
         console.warn('[PCM] sendCustomMessage failed:', e && e.message);
+      }
+    }
+
+    function removeNativeAudioEventListeners() {
+      for (const entry of pcmNativeEventHandlers) {
+        try { webrtcAudio.removeEventListener(entry.event, entry.listener); } catch (e) {}
+      }
+      pcmNativeEventHandlers = [];
+    }
+
+    function recoverNativeAudioAtLiveEdge(reason) {
+      const audioEl = webrtcAudio;
+      const url = pcmNativeUrl;
+      if (currentMode !== 'http-pcm' || !url) return;
+
+      const now = Date.now();
+      if (now - pcmNativeStartedAt < PCM_NATIVE_RECOVERY_GRACE_MS) return;
+      if (now - pcmNativeLastRecoveryAt < PCM_NATIVE_RECOVERY_COOLDOWN_MS) return;
+      pcmNativeLastRecoveryAt = now;
+      pcmNativeStartedAt = now;
+      reportPcmStatus('plain-audio-live-recovery', reason);
+
+      // The Cast Audio native player exposes an unbounded/non-seekable live
+      // timeline, so currentTime cannot trim its internal queue. Re-opening
+      // the same URL is the native <audio>-only way to discard stale decoded
+      // data and start from the server's current live edge.
+      try {
+        audioEl.pause();
+        audioEl.removeAttribute('src');
+        audioEl.load();
+        audioEl.src = url;
+        audioEl.load();
+        const playResult = audioEl.play();
+        if (playResult && typeof playResult.catch === 'function') {
+          playResult.catch((e) => reportPcmStatus('plain-audio-recovery-play-rejected', (e && e.name) + ': ' + (e && e.message)));
+        }
+      } catch (e) {
+        reportPcmStatus('plain-audio-recovery-failed', e && e.message);
+      }
+    }
+
+    function scheduleNativeAudioRecovery(reason) {
+      if (currentMode !== 'http-pcm' || !pcmNativeUrl || pcmNativeRecoveryTimer) return;
+      pcmNativeRecoveryTimer = setTimeout(() => {
+        pcmNativeRecoveryTimer = null;
+        recoverNativeAudioAtLiveEdge(reason);
+      }, 150);
+    }
+
+    function attachNativeAudioEventListeners(audioEl) {
+      removeNativeAudioEventListeners();
+      const events = ['loadstart','loadedmetadata','loadeddata','canplay','canplaythrough','playing','waiting','stalled','suspend','ended','error','emptied'];
+      for (const ev of events) {
+        const listener = function() {
+          let detail;
+          if (ev === 'error') {
+            const me = audioEl.error;
+            detail = me ? `code=${me.code} msg=${me.message}` : 'unknown';
+          } else {
+            detail = describeAudioElement(audioEl);
+          }
+          reportPcmStatus('audio-' + ev, detail);
+          if (ev === 'playing') reportPcmStatus('playing', detail);
+          if (ev === 'waiting' || ev === 'stalled' || ev === 'error') {
+            scheduleNativeAudioRecovery('audio-' + ev);
+          }
+        };
+        pcmNativeEventHandlers.push({ event: ev, listener });
+        audioEl.addEventListener(ev, listener);
       }
     }
 
@@ -644,6 +725,8 @@
       const audioEl = webrtcAudio;
       try { hlsAudio.pause(); hlsAudio.removeAttribute('src'); hlsAudio.load(); } catch (e) {}
 
+      pcmNativeUrl = httpUrl;
+      pcmNativeStartedAt = Date.now();
       audioEl.preload = 'auto';
       audioEl.crossOrigin = 'anonymous';
       audioEl.playbackRate = 1.0;
@@ -1001,21 +1084,10 @@
       if ('mozPreservesPitch' in audioEl) audioEl.mozPreservesPitch = true;
       if ('webkitPreservesPitch' in audioEl) audioEl.webkitPreservesPitch = true;
 
-      // Wire up the native media events as status reports back to the PC
-      const events = ['loadstart','loadedmetadata','loadeddata','canplay','canplaythrough','playing','waiting','stalled','suspend','ended','error','emptied'];
-      events.forEach(ev => {
-        audioEl.addEventListener(ev, function listener() {
-          let detail;
-          if (ev === 'error') {
-            const me = audioEl.error;
-            detail = me ? `code=${me.code} msg=${me.message}` : 'unknown';
-          } else {
-            detail = describeAudioElement(audioEl);
-          }
-          reportPcmStatus('audio-' + ev, detail);
-          if (ev === 'playing') reportPcmStatus('playing', detail);
-        }, { once: false });
-      });
+      // Wire native events once per connection. Under-runs trigger a fresh
+      // live-edge connection instead of allowing the opaque Cast queue to
+      // increase its playback threshold indefinitely.
+      attachNativeAudioEventListeners(audioEl);
 
       audioEl.src = httpUrl;
       reportPcmStatus('audio-src-set', httpUrl);
